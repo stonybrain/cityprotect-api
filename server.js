@@ -24,10 +24,12 @@ const H = {
   "accept": "application/json",
   "origin": "https://www.cityprotect.com",
   "referer": "https://www.cityprotect.com/",
-  "user-agent": "Mozilla/5.0"
+  "user-agent": "Mozilla/5.0",
+  "accept-language": "en-US,en;q=0.9"
 };
 
-// Redding polygon + agencies + categories
+// Redding polygon + agencies + categories (your working set)
+// Tip: once stable, change 72h -> 24h below to tighten the window.
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -53,7 +55,9 @@ const BASE = {
     timezone: "+00:00",
     relativeDate: "custom",
     id: "5dfab4da933cf80011f565bc",
+    // include both numeric + domain agency IDs (seen in your raw)
     agencyIds: "112398,112005,ci.anderson.ca.us,cityofredding.org",
+    // burglary/theft/etc.
     parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
   }
 };
@@ -70,27 +74,45 @@ const fetchJSON = async (url, opts = {}) => {
   return r.json();
 };
 
-/* ---------- RAW (debug) ---------- */
+/* ---------- RAW (super-verbose debug) ---------- */
 app.get("/api/raw", async (_req, res) => {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000); // 72h for visibility
+    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000); // 72h to ensure data
     const body = {
       ...BASE,
       propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() }
     };
-    const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
-    res.json(j);
+
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 15000);
+
+    console.log("RAW: POST", EP);
+    const r = await fetch(EP, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    clearTimeout(t);
+
+    const status = r.status;
+    const text = await r.text();
+    console.log("RAW: status", status, "len", text.length);
+
+    res.set("Cache-Control", "no-store");
+    res.type("text/plain").send(`status=${status}\n\n${text.slice(0, 2000)}`);
   } catch (e) {
-    res.status(500).json({ error: e?.message || "fetch-failed" });
+    console.error("RAW error:", e);
+    res.status(500).type("text/plain").send("error: " + (e.message || e));
   }
 });
 
-/* ---------- Clean list ---------- */
+/* ---------- Clean list (safe paging) ---------- */
 app.get("/api/redding-24h", async (_req, res) => {
   try {
     const now = new Date();
-    // Use 72h to ensure results while testing; change 72 -> 24 later if you want
+    // use 72h for reliability during setup; change to 24h later
     const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
 
     const firstBody = {
@@ -102,7 +124,7 @@ app.get("/api/redding-24h", async (_req, res) => {
     const j1 = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(firstBody) });
     let all = pickIncidents(j1);
 
-    // Pagination: uses nextPagePath.requestData (NOT a URL)
+    // Pagination: nextPagePath.requestData → POST the same EP with that body
     let nextReq = j1?.navigation?.nextPagePath?.requestData || null;
     const seen = new Set();
 
@@ -116,6 +138,7 @@ app.get("/api/redding-24h", async (_req, res) => {
       nextReq = j?.navigation?.nextPagePath?.requestData || null;
     }
 
+    // Map to minimal fields you need for the widget
     const incidents = all.map(x => ({
       id: x.id || x._id || null,
       type: x.incidentType || x.parentIncidentType || "Unknown",
@@ -126,6 +149,7 @@ app.get("/api/redding-24h", async (_req, res) => {
 
     res.json({ updated: now.toISOString(), hours: 72, total: incidents.length, incidents });
   } catch (e) {
+    console.error("CLEAN error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
   }
 });
