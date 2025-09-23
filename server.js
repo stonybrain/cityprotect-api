@@ -28,7 +28,6 @@ const H = {
   "accept-language": "en-US,en;q=0.9",
 };
 
-// Redding polygon + agencies + categories
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -69,19 +68,32 @@ const fetchJSON = async (url, opts = {}) => {
   return r.json();
 };
 
-/* ---------- RAW (debug) ---------- */
+// Very simple zone classifier for Redding
+// Tune thresholds if you want different splits.
+function zoneFor(lat, lon) {
+  if (lat == null || lon == null) return "Unknown";
+  if (lat >= 40.62) return "North Redding";
+  if (lat <= 40.55) return "South Redding";
+  if (lon <= -122.42) return "West Redding";
+  if (lon >= -122.36) return "East Redding";
+  return "Central Redding";
+}
+
+function groupCount(arr, keyFn) {
+  const m = {};
+  for (const x of arr) {
+    const k = keyFn(x) || "Other";
+    m[k] = (m[k] || 0) + 1;
+  }
+  return m;
+}
+
+/* ---------- RAW (debug 72h) ---------- */
 app.get("/api/raw", async (_req, res) => {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const body = {
-      ...BASE,
-      propertyMap: {
-        ...BASE.propertyMap,
-        fromDate: from.toISOString(),
-        toDate: now.toISOString(),
-      },
-    };
+    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
+    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
     const r = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
     const status = r.status;
     const text = await r.text();
@@ -92,19 +104,11 @@ app.get("/api/raw", async (_req, res) => {
   }
 });
 
-/* ---------- Clean list (24h + filtered) ---------- */
-/* parentTypeId filter:
-   100 = Burglary / Home Invasion (Breaking & Entering)
-    99 = Theft of Vehicle (10851)
-   103 = Other Theft (petty/pt etc.)
-   166 = Trespass (often mapped here)
-*/
-const KEEP_IDS = new Set([100, 99, 103, 166]);
-
-app.get("/api/redding-24h", async (_req, res) => {
+/* ---------- 72h + zones + categories (one page) ---------- */
+app.get("/api/redding-72h", async (_req, res) => {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
 
     const body = {
       ...BASE,
@@ -115,25 +119,37 @@ app.get("/api/redding-24h", async (_req, res) => {
       },
     };
 
-    // one-page fetch (fast + reliable)
     const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
-    const all = j?.result?.list?.incidents ?? [];
+    const raw = j?.result?.list?.incidents ?? [];
 
-    // map minimal fields
-    let incidents = all.map((x) => ({
-      id: x.id || null,
-      type: x.incidentType || x.parentIncidentType || "Unknown",
-      parentTypeId: x.parentIncidentTypeId ?? null,
-      lon: x.location?.coordinates?.[0] ?? null,
-      lat: x.location?.coordinates?.[1] ?? null,
-    }));
+    // Map minimal fields + zone
+    const incidents = raw.map((x) => {
+      const lon = x.location?.coordinates?.[0] ?? null;
+      const lat = x.location?.coordinates?.[1] ?? null;
+      return {
+        id: x.id || null,
+        type: x.incidentType || x.parentIncidentType || "Unknown",
+        parent: x.parentIncidentType || "Unknown",
+        parentTypeId: x.parentIncidentTypeId ?? null,
+        lon, lat,
+        zone: zoneFor(lat, lon),
+      };
+    });
 
-    // filter to burglary/theft/trespass/vehicle theft
-    incidents = incidents.filter((i) => KEEP_IDS.has(i.parentTypeId));
+    // Group counts
+    const categories = groupCount(incidents, (i) => i.parent);
+    const zones = groupCount(incidents, (i) => i.zone);
 
-    res.json({ updated: now.toISOString(), hours: 24, total: incidents.length, incidents });
+    res.json({
+      updated: now.toISOString(),
+      hours: 72,
+      total: incidents.length,
+      categories,
+      zones,
+      incidents,
+    });
   } catch (e) {
-    console.error("CLEAN error:", e);
+    console.error("72H error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
   }
 });
