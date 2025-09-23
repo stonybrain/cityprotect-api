@@ -4,10 +4,18 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// ✅ Allow Squarespace/JSFiddle to call your API
+app.use((_, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
 
-// Base payload derived from your Network capture.
-const BASE = {
+// Base payload for Redding
+const payload = {
   limit: 2000,
   offset: 0,
   geoJson: {
@@ -22,6 +30,8 @@ const BASE = {
   },
   projection: true,
   propertyMap: {
+    toDate: "2025-09-23T23:59:59.999Z",
+    fromDate: "2025-09-20T00:00:00.000Z",
     pageSize: "2000",
     parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
     zoomLevel: "11",
@@ -37,57 +47,38 @@ const BASE = {
   }
 };
 
-// Helper to page through results if needed
-async function fetchAll(body) {
-  const headers = { "content-type":"application/json", "accept":"application/json" };
-  const first = await fetch(EP, { method: "POST", headers, body: JSON.stringify(body) });
-  const j1 = await first.json();
-  let all = j1.incidents || [];
-  let next = j1.navigation?.nextPagePath;
-  let nextData = j1.navigation?.nextPageData?.requestData;
+// Headers to mimic browser request
+const headers = {
+  "content-type": "application/json",
+  "accept": "application/json",
+  "origin": "https://www.cityprotect.com",
+  "referer": "https://www.cityprotect.com/",
+  "user-agent": "Mozilla/5.0"
+};
 
-  while (next) {
-    const r = await fetch("https://ce-portal-service.commandcentral.com" + next, {
+app.get("/api/redding-24h", async (req, res) => {
+  try {
+    const resp = await fetch(EP, {
       method: "POST",
       headers,
-      body: JSON.stringify(nextData || body)
+      body: JSON.stringify(payload)
     });
-    const j = await r.json();
-    all = all.concat(j.incidents || []);
-    next = j.navigation?.nextPagePath;
-    nextData = j.navigation?.nextPageData?.requestData;
-  }
-  return all;
-}
 
-// Main endpoint: rolling last 24 hours for Redding area polygon & chosen incident categories
-app.get("/api/redding-24h", async (_req, res) => {
-  try {
-    const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const body = {
-      ...BASE,
-      propertyMap: {
-        ...BASE.propertyMap,
-        fromDate: from.toISOString(),
-        toDate: now.toISOString()
-      }
-    };
-    const all = await fetchAll(body);
-    const incidents = all.map(x => ({
-      time: x.occurredOn || x.incidentDate || x.date || null,
-      type: x.parentIncidentTypeName || x.incidentType || x.type || "Unknown",
-      address: x.blockAddress || x.address || x.location || "",
-      city: x.city || "Redding",
-      lat: x.latitude ?? x.geometry?.y ?? null,
-      lon: x.longitude ?? x.geometry?.x ?? null
-    }));
-    res.json({ updated: now.toISOString(), hours: 24, total: incidents.length, incidents });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || "fetch-failed" });
+    const data = await resp.json();
+    res.json({
+      total: data.total || data.count || (data.items ? data.items.length : 0),
+      incidents: (data.items || []).map(x => ({
+        type: x.incidentCategory || x.type || "Unknown",
+        address: x.address || "Unknown",
+        time: x.occurredOn || x.time
+      }))
+    });
+  } catch (err) {
+    console.error("Error fetching incidents:", err);
+    res.status(500).json({ error: "Failed to fetch incidents" });
   }
 });
 
 app.listen(PORT, () => {
-  console.log("cityprotect-api on :" + PORT);
+  console.log(`cityprotect-api running on :${PORT}`);
 });
