@@ -4,6 +4,7 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// CORS so JSFiddle/Squarespace can call it
 app.use((_, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -11,6 +12,11 @@ app.use((_, res, next) => {
   next();
 });
 
+// ---- Health/test routes ----
+app.get("/", (_, res) => res.send("ok"));
+app.get("/api/test", (_, res) => res.json({ ok: true }));
+
+// ---- CityProtect proxy config ----
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
 const BASE_HEADERS = {
   "content-type": "application/json",
@@ -20,6 +26,7 @@ const BASE_HEADERS = {
   "user-agent": "Mozilla/5.0"
 };
 
+// Redding poly + filters (your payload)
 const BASE = {
   limit: 2000, offset: 0,
   geoJson: { type: "Polygon", coordinates: [[
@@ -42,8 +49,8 @@ const BASE = {
 function toAbs(url) {
   if (!url) return null;
   if (url.startsWith("http")) return url;
-  if (!url.startsWith("/")) return null;
-  return "https://ce-portal-service.commandcentral.com" + url;
+  if (url.startsWith("/")) return "https://ce-portal-service.commandcentral.com" + url;
+  return null;
 }
 
 app.get("/api/redding-24h", async (_req, res) => {
@@ -67,7 +74,7 @@ app.get("/api/redding-24h", async (_req, res) => {
 
     while (nextPath) {
       const nextUrl = toAbs(nextPath);
-      if (!nextUrl) break;                // guard against invalid URL
+      if (!nextUrl) break;
       const r = await fetch(nextUrl, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(nextData) });
       const j = await r.json();
       all = all.concat(j.incidents || []);
