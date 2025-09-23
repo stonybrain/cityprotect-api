@@ -16,7 +16,7 @@ app.use((_, res, next) => {
 app.get("/", (_, res) => res.send("ok"));
 app.get("/api/test", (_, res) => res.json({ ok: true }));
 
-// ----- CityProtect proxy -----
+// CityProtect
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
 const BASE_HEADERS = {
   "content-type": "application/json",
@@ -26,6 +26,7 @@ const BASE_HEADERS = {
   "user-agent": "Mozilla/5.0"
 };
 
+// Redding polygon; NOTE: no parentIncidentTypeIds => ALL incidents
 const BASE = {
   limit: 2000, offset: 0,
   geoJson: { type: "Polygon", coordinates: [[
@@ -36,7 +37,6 @@ const BASE = {
   projection: true,
   propertyMap: {
     pageSize:"2000",
-    parentIncidentTypeIds:"149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
     zoomLevel:"11", latitude:"40.573945", longitude:"-122.381764",
     days:"1,2,3,4,5,6,7", startHour:"0", endHour:"24",
     timezone:"+00:00", relativeDate:"custom",
@@ -46,7 +46,7 @@ const BASE = {
 };
 
 function toAbs(url) {
-  if (!url || typeof url !== "string") return null;           // <-- fix
+  if (!url || typeof url !== "string") return null;
   if (url.startsWith("http")) return url;
   if (url.startsWith("/")) return "https://ce-portal-service.commandcentral.com" + url;
   return null;
@@ -56,6 +56,7 @@ app.get("/api/redding-24h", async (_req, res) => {
   try {
     const now = new Date();
     const from = new Date(now.getTime() - 24*60*60*1000);
+
     const body = {
       ...BASE,
       propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() }
@@ -66,7 +67,7 @@ app.get("/api/redding-24h", async (_req, res) => {
     const j1 = await r1.json();
     let all = j1.incidents || [];
 
-    // paginate safely
+    // paginate
     let nextPath = j1.navigation?.nextPagePath;
     let nextData = j1.navigation?.nextPageData?.requestData || body;
 
