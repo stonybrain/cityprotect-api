@@ -4,7 +4,6 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ✅ Allow Squarespace/JSFiddle to call your API
 app.use((_, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -13,42 +12,7 @@ app.use((_, res, next) => {
 });
 
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
-
-// Base payload for Redding
-const payload = {
-  limit: 2000,
-  offset: 0,
-  geoJson: {
-    type: "Polygon",
-    coordinates: [[
-      [-122.20872933, 40.37101482],
-      [-122.55479867, 40.37101482],
-      [-122.55479867, 40.77626157],
-      [-122.20872933, 40.77626157],
-      [-122.20872933, 40.37101482]
-    ]]
-  },
-  projection: true,
-  propertyMap: {
-    toDate: "2025-09-23T23:59:59.999Z",
-    fromDate: "2025-09-20T00:00:00.000Z",
-    pageSize: "2000",
-    parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
-    zoomLevel: "11",
-    latitude: "40.573945",
-    longitude: "-122.381764",
-    days: "1,2,3,4,5,6,7",
-    startHour: "0",
-    endHour: "24",
-    timezone: "+00:00",
-    relativeDate: "custom",
-    id: "5dfab4da933cf80011f565bc",
-    agencyIds: "cityofredding.org,ci.anderson.ca.us"
-  }
-};
-
-// Headers to mimic browser request
-const headers = {
+const BASE_HEADERS = {
   "content-type": "application/json",
   "accept": "application/json",
   "origin": "https://www.cityprotect.com",
@@ -56,29 +20,74 @@ const headers = {
   "user-agent": "Mozilla/5.0"
 };
 
-app.get("/api/redding-24h", async (req, res) => {
-  try {
-    const resp = await fetch(EP, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload)
-    });
+const BASE = {
+  limit: 2000, offset: 0,
+  geoJson: { type: "Polygon", coordinates: [[
+    [-122.20872933,40.37101482],[-122.55479867,40.37101482],
+    [-122.55479867,40.77626157],[-122.20872933,40.77626157],
+    [-122.20872933,40.37101482]
+  ]]},
+  projection: true,
+  propertyMap: {
+    pageSize:"2000",
+    parentIncidentTypeIds:"149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
+    zoomLevel:"11", latitude:"40.573945", longitude:"-122.381764",
+    days:"1,2,3,4,5,6,7", startHour:"0", endHour:"24",
+    timezone:"+00:00", relativeDate:"custom",
+    id:"5dfab4da933cf80011f565bc",
+    agencyIds:"cityofredding.org,ci.anderson.ca.us"
+  }
+};
 
-    const data = await resp.json();
-    res.json({
-      total: data.total || data.count || (data.items ? data.items.length : 0),
-      incidents: (data.items || []).map(x => ({
-        type: x.incidentCategory || x.type || "Unknown",
-        address: x.address || "Unknown",
-        time: x.occurredOn || x.time
-      }))
-    });
-  } catch (err) {
-    console.error("Error fetching incidents:", err);
-    res.status(500).json({ error: "Failed to fetch incidents" });
+function toAbs(url) {
+  if (!url) return null;
+  if (url.startsWith("http")) return url;
+  if (!url.startsWith("/")) return null;
+  return "https://ce-portal-service.commandcentral.com" + url;
+}
+
+app.get("/api/redding-24h", async (_req, res) => {
+  try {
+    const now = new Date();
+    const from = new Date(now.getTime() - 24*60*60*1000);
+
+    const body = {
+      ...BASE,
+      propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() }
+    };
+
+    // page 1
+    const r1 = await fetch(EP, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(body) });
+    const j1 = await r1.json();
+    let all = j1.incidents || [];
+
+    // paginate if present (safely)
+    let nextPath = j1.navigation?.nextPagePath;
+    let nextData = j1.navigation?.nextPageData?.requestData || body;
+
+    while (nextPath) {
+      const nextUrl = toAbs(nextPath);
+      if (!nextUrl) break;                // guard against invalid URL
+      const r = await fetch(nextUrl, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(nextData) });
+      const j = await r.json();
+      all = all.concat(j.incidents || []);
+      nextPath = j.navigation?.nextPagePath;
+      nextData = j.navigation?.nextPageData?.requestData || nextData;
+    }
+
+    const incidents = all.map(x => ({
+      time: x.occurredOn || x.incidentDate || x.date || null,
+      type: x.parentIncidentTypeName || x.incidentType || x.type || "Unknown",
+      address: x.blockAddress || x.address || x.location || "",
+      city: x.city || "Redding",
+      lat: x.latitude ?? x.geometry?.y ?? null,
+      lon: x.longitude ?? x.geometry?.x ?? null
+    }));
+
+    res.json({ updated: now.toISOString(), hours: 24, total: incidents.length, incidents });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "fetch-failed" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`cityprotect-api running on :${PORT}`);
-});
+app.listen(PORT, () => console.log("cityprotect-api on :"+PORT));
