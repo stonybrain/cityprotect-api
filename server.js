@@ -26,9 +26,10 @@ const BASE_HEADERS = {
   "user-agent": "Mozilla/5.0"
 };
 
-// Redding polygon; NOTE: no parentIncidentTypeIds => ALL incidents
+// Polygon around Redding
 const BASE = {
-  limit: 2000, offset: 0,
+  limit: 2000,
+  offset: 0,
   geoJson: { type: "Polygon", coordinates: [[
     [-122.20872933,40.37101482],[-122.55479867,40.37101482],
     [-122.55479867,40.77626157],[-122.20872933,40.77626157],
@@ -45,6 +46,7 @@ const BASE = {
   }
 };
 
+// helper
 function toAbs(url) {
   if (!url || typeof url !== "string") return null;
   if (url.startsWith("http")) return url;
@@ -52,22 +54,53 @@ function toAbs(url) {
   return null;
 }
 
-app.get("/api/redding-24h", async (_req, res) => {
+// ---- ROUTES ----
+
+// Debug: raw CityProtect JSON
+app.get("/api/raw", async (_req, res) => {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - 24*60*60*1000);
+    const from = new Date(now.getTime() - 72*60*60*1000); // 72h window
 
     const body = {
       ...BASE,
-      propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() }
+      propertyMap: {
+        ...BASE.propertyMap,
+        fromDate: from.toISOString(),
+        toDate: now.toISOString(),
+        parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
+      }
     };
 
-    // first page
+    const resp = await fetch(EP, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(body) });
+    const data = await resp.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "fetch-failed" });
+  }
+});
+
+// Clean: mapped incidents
+app.get("/api/redding-24h", async (_req, res) => {
+  try {
+    const now = new Date();
+    const from = new Date(now.getTime() - 72*60*60*1000); // 72h window for now
+
+    const body = {
+      ...BASE,
+      propertyMap: {
+        ...BASE.propertyMap,
+        fromDate: from.toISOString(),
+        toDate: now.toISOString(),
+        parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
+      }
+    };
+
     const r1 = await fetch(EP, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(body) });
     const j1 = await r1.json();
     let all = j1.incidents || [];
 
-    // paginate
+    // paginate if available
     let nextPath = j1.navigation?.nextPagePath;
     let nextData = j1.navigation?.nextPageData?.requestData || body;
 
@@ -90,7 +123,7 @@ app.get("/api/redding-24h", async (_req, res) => {
       lon: x.longitude ?? x.geometry?.x ?? null
     }));
 
-    res.json({ updated: now.toISOString(), hours: 24, total: incidents.length, incidents });
+    res.json({ updated: now.toISOString(), hours: 72, total: incidents.length, incidents });
   } catch (e) {
     res.status(500).json({ error: e?.message || "fetch-failed" });
   }
