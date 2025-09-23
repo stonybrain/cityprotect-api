@@ -18,7 +18,7 @@ app.get("/api/test", (_, res) => res.json({ ok: true }));
 
 // CityProtect
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
-const BASE_HEADERS = {
+const H = {
   "content-type": "application/json",
   "accept": "application/json",
   "origin": "https://www.cityprotect.com",
@@ -26,7 +26,7 @@ const BASE_HEADERS = {
   "user-agent": "Mozilla/5.0"
 };
 
-// Polygon around Redding
+// Redding polygon + agencies
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -37,90 +37,70 @@ const BASE = {
   ]]},
   projection: true,
   propertyMap: {
-    pageSize:"2000",
-    zoomLevel:"11", latitude:"40.573945", longitude:"-122.381764",
-    days:"1,2,3,4,5,6,7", startHour:"0", endHour:"24",
-    timezone:"+00:00", relativeDate:"custom",
-    id:"5dfab4da933cf80011f565bc",
-    agencyIds:"cityofredding.org,ci.anderson.ca.us"
+    pageSize: "2000",
+    zoomLevel: "11",
+    latitude: "40.573945",
+    longitude: "-122.381764",
+    days: "1,2,3,4,5,6,7",
+    startHour: "0",
+    endHour: "24",
+    timezone: "+00:00",
+    relativeDate: "custom",
+    id: "5dfab4da933cf80011f565bc",
+    // include both numeric + domain agency IDs (as seen in your raw)
+    agencyIds: "112398,112005,ci.anderson.ca.us,cityofredding.org",
+    // burglary/theft/etc. — keep for now
+    parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
   }
 };
 
-// helper
-function toAbs(url) {
-  if (!url || typeof url !== "string") return null;
-  if (url.startsWith("http")) return url;
-  if (url.startsWith("/")) return "https://ce-portal-service.commandcentral.com" + url;
-  return null;
-}
+// helper: get incidents array from any page shape
+const pickIncidents = (j) =>
+  j?.result?.list?.incidents ?? j?.incidents ?? j?.items ?? [];
 
-// ---- ROUTES ----
-
-// Debug: raw CityProtect JSON
+// ---- RAW (debug) ----
 app.get("/api/raw", async (_req, res) => {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - 72*60*60*1000); // 72h window
-
-    const body = {
-      ...BASE,
-      propertyMap: {
-        ...BASE.propertyMap,
-        fromDate: from.toISOString(),
-        toDate: now.toISOString(),
-        parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
-      }
-    };
-
-    const resp = await fetch(EP, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(body) });
-    const data = await resp.json();
-    res.json(data);
+    const from = new Date(now.getTime() - 72*60*60*1000); // 72h
+    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
+    const r = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
+    const j = await r.json();
+    res.json(j);
   } catch (e) {
     res.status(500).json({ error: e?.message || "fetch-failed" });
   }
 });
 
-// Clean: mapped incidents
+// ---- CLEAN LIST ----
 app.get("/api/redding-24h", async (_req, res) => {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - 72*60*60*1000); // 72h window for now
+    const from = new Date(now.getTime() - 72*60*60*1000); // use 72h to ensure results; change to 24h later if you want
+    const firstBody = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
 
-    const body = {
-      ...BASE,
-      propertyMap: {
-        ...BASE.propertyMap,
-        fromDate: from.toISOString(),
-        toDate: now.toISOString(),
-        parentIncidentTypeIds: "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
-      }
-    };
-
-    const r1 = await fetch(EP, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(body) });
+    // page 1
+    const r1 = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(firstBody) });
     const j1 = await r1.json();
-    let all = j1.incidents || [];
+    let all = pickIncidents(j1);
 
-    // paginate if available
-    let nextPath = j1.navigation?.nextPagePath;
-    let nextData = j1.navigation?.nextPageData?.requestData || body;
+    // pagination (CityProtect uses nextPagePath.requestData, not a URL)
+    let nextReq = j1?.navigation?.nextPagePath?.requestData || null;
 
-    while (nextPath) {
-      const nextUrl = toAbs(nextPath);
-      if (!nextUrl) break;
-      const r = await fetch(nextUrl, { method:"POST", headers: BASE_HEADERS, body: JSON.stringify(nextData) });
+    while (nextReq) {
+      const r = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(nextReq) });
       const j = await r.json();
-      all = all.concat(j.incidents || []);
-      nextPath = j.navigation?.nextPagePath;
-      nextData = j.navigation?.nextPageData?.requestData || nextData;
+      all = all.concat(pickIncidents(j));
+      nextReq = j?.navigation?.nextPagePath?.requestData || null;
     }
 
     const incidents = all.map(x => ({
-      time: x.occurredOn || x.incidentDate || x.date || null,
-      type: x.parentIncidentTypeName || x.incidentType || x.type || "Unknown",
-      address: x.blockAddress || x.address || x.location || "",
-      city: x.city || "Redding",
-      lat: x.latitude ?? x.geometry?.y ?? null,
-      lon: x.longitude ?? x.geometry?.x ?? null
+      id: x.id || x._id || null,
+      type: x.incidentType || x.parentIncidentType || "Unknown",
+      parentTypeId: x.parentIncidentTypeId ?? null,
+      // coords are [lon,lat]
+      lon: x.location?.coordinates?.[0] ?? null,
+      lat: x.location?.coordinates?.[1] ?? null
     }));
 
     res.json({ updated: now.toISOString(), hours: 72, total: incidents.length, incidents });
