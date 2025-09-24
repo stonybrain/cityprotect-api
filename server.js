@@ -4,6 +4,10 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+/* ---------- ENV (Discord) ---------- */
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
+const NOTIFY_SECRET = process.env.NOTIFY_SECRET || ""; // optional but recommended
+
 /* ---------- CORS ---------- */
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
@@ -28,6 +32,7 @@ const H = {
   "accept-language": "en-US,en;q=0.9",
 };
 
+// Base body
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -65,11 +70,17 @@ const fetchJSON = async (url, opts = {}) => {
   const t = setTimeout(() => controller.abort(), 15000);
   const r = await fetch(url, { ...opts, signal: controller.signal });
   clearTimeout(t);
-  return r.json();
+  // try text -> json to improve error logging if bad JSON
+  const text = await r.text();
+  try { return JSON.parse(text); } catch {
+    // if not JSON, throw with body included
+    const err = new Error(`Bad JSON from ${url} (status ${r.status}): ${text.slice(0,200)}`);
+    err.status = r.status;
+    throw err;
+  }
 };
 
 // Very simple zone classifier for Redding
-// Tune thresholds if you want different splits.
 function zoneFor(lat, lon) {
   if (lat == null || lon == null) return "Unknown";
   if (lat >= 40.62) return "North Redding";
@@ -122,7 +133,6 @@ app.get("/api/redding-72h", async (_req, res) => {
     const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
     const raw = j?.result?.list?.incidents ?? [];
 
-    // Map minimal fields + zone
     const incidents = raw.map((x) => {
       const lon = x.location?.coordinates?.[0] ?? null;
       const lat = x.location?.coordinates?.[1] ?? null;
@@ -136,7 +146,6 @@ app.get("/api/redding-72h", async (_req, res) => {
       };
     });
 
-    // Group counts
     const categories = groupCount(incidents, (i) => i.parent);
     const zones = groupCount(incidents, (i) => i.zone);
 
@@ -151,6 +160,114 @@ app.get("/api/redding-72h", async (_req, res) => {
   } catch (e) {
     console.error("72H error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
+  }
+});
+
+/* ======================================================================
+   ==============   DISCORD NOTIFICATIONS (optional)  ====================
+   ====================================================================== */
+
+/** Minimal in-memory sent-id set (resets on redeploy). */
+const SENT_IDS = new Set();
+
+/** Format a short Discord message for a batch of incidents. */
+function formatDiscordMessage(newItems, totalCount) {
+  const lines = [];
+  lines.push(`**Redding Crime — New Incidents (${newItems.length})**`);
+  const take = newItems.slice(0, 10); // show first 10
+  for (const i of take) {
+    const z = i.zone || "Unknown";
+    const ll = (i.lat != null && i.lon != null)
+      ? ` (${i.lat.toFixed(4)}, ${i.lon.toFixed(4)})` : "";
+    lines.push(`• ${i.type} — ${z}${ll}`);
+  }
+  if (newItems.length > take.length) {
+    lines.push(`…and ${newItems.length - take.length} more.`);
+  }
+  lines.push(`_Window: last 72 hours. Total in window: ${totalCount}._`);
+  return lines.join("\n");
+}
+
+/** Post to Discord webhook. */
+async function postToDiscord(content) {
+  if (!DISCORD_WEBHOOK_URL) {
+    throw new Error("DISCORD_WEBHOOK_URL not set");
+  }
+  const payload = {
+    content,
+    username: "AAX Crime Alerts",
+    allowed_mentions: { parse: [] }
+  };
+  const r = await fetch(DISCORD_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Discord webhook failed (${r.status}): ${t.slice(0,200)}`);
+  }
+}
+
+/**
+ * GET /api/notify?key=SECRET
+ * - Fetches /api/redding-72h internally
+ * - Filters out incidents we've already sent (by id)
+ * - Sends a batch message to Discord if there are new ones
+ */
+app.get("/api/notify", async (req, res) => {
+  try {
+    if (NOTIFY_SECRET) {
+      const key = (req.query.key || "").toString();
+      if (key !== NOTIFY_SECRET) return res.status(401).json({ error: "unauthorized" });
+    }
+
+    // Pull the current 72h snapshot
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const r = await fetch(`${baseUrl}/api/redding-72h`, { headers: { "cache-control": "no-store" }});
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`Failed to fetch redding-72h (${r.status}): ${t.slice(0,200)}`);
+    }
+    const data = await r.json();
+    const incidents = data?.incidents || [];
+
+    // Determine which are new (by id)
+    const newOnes = incidents.filter(i => i?.id && !SENT_IDS.has(i.id));
+
+    if (newOnes.length === 0) {
+      return res.json({ ok: true, sent: 0, message: "No new incidents." });
+    }
+
+    // Mark them as sent (so the next call only sends new stuff)
+    newOnes.forEach(i => SENT_IDS.add(i.id));
+
+    // Build + send the message
+    const msg = formatDiscordMessage(newOnes, data.total || incidents.length);
+    await postToDiscord(msg);
+
+    res.json({ ok: true, sent: newOnes.length });
+  } catch (e) {
+    console.error("notify error:", e);
+    res.status(500).json({ error: e?.message || "notify-failed" });
+  }
+});
+
+/**
+ * GET /api/notify-test?key=SECRET
+ * - Sends a simple test message to confirm webhook works
+ */
+app.get("/api/notify-test", async (req, res) => {
+  try {
+    if (NOTIFY_SECRET) {
+      const key = (req.query.key || "").toString();
+      if (key !== NOTIFY_SECRET) return res.status(401).json({ error: "unauthorized" });
+    }
+    await postToDiscord("✅ Test from AAX Crime Alerts — webhook is working.");
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("notify-test error:", e);
+    res.status(500).json({ error: e?.message || "notify-test-failed" });
   }
 });
 
