@@ -151,6 +151,64 @@ app.get("/api/redding-72h", async (_req, res) => {
   }
 });
 
+/* ---------- Generic window: /api/redding?hours=72|36|24|12|6|3|1 ---------- */
+
+// parse & clamp hours to supported choices
+function parseHours(q) {
+  const n = Number(q);
+  const allowed = [72, 36, 24, 12, 6, 3, 1];
+  if (!Number.isFinite(n)) return 72;
+  return allowed.includes(n) ? n : 72;
+}
+
+app.get("/api/redding", async (req, res) => {
+  try {
+    const hours = parseHours(req.query.hours);
+    const now = new Date();
+    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
+
+    const body = {
+      ...BASE,
+      propertyMap: {
+        ...BASE.propertyMap,
+        fromDate: from.toISOString(),
+        toDate: now.toISOString(),
+      },
+    };
+
+    const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
+    const raw = j?.result?.list?.incidents ?? [];
+
+    const incidents = raw.map((x) => {
+      const lon = x.location?.coordinates?.[0] ?? null;
+      const lat = x.location?.coordinates?.[1] ?? null;
+      return {
+        id: x.id || null,
+        type: x.incidentType || x.parentIncidentType || "Unknown",
+        parent: x.parentIncidentType || "Unknown",
+        parentTypeId: x.parentIncidentTypeId ?? null,
+        lon, lat,
+        zone: zoneFor(lat, lon),
+      };
+    });
+
+    const categories = groupCount(incidents, (i) => i.parent);
+    const zones = groupCount(incidents, (i) => i.zone);
+
+    res.json({
+      updated: now.toISOString(),
+      hours,
+      total: incidents.length,
+      categories,
+      zones,
+      incidents,
+    });
+  } catch (e) {
+    console.error("redding error:", e);
+    res.status(500).json({ error: e?.message || "fetch-failed" });
+  }
+});
+
 /* =========================================================
    ==============  DISCORD PUSH ENDPOINTS  =================
    ========================================================= */
