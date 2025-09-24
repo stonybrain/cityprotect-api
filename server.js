@@ -1,11 +1,10 @@
-// server.js
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ---------- CORS (incl. preflight) ---------- */
+/* ---------- CORS ---------- */
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -15,8 +14,8 @@ app.use((req, res, next) => {
 });
 
 /* ---------- Health ---------- */
-app.get("/", (_req, res) => res.send("ok"));
-app.get("/api/test", (_req, res) => res.json({ ok: true }));
+app.get("/", (_, res) => res.send("ok"));
+app.get("/api/test", (_, res) => res.json({ ok: true }));
 
 /* ---------- CityProtect config ---------- */
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
@@ -29,7 +28,6 @@ const H = {
   "accept-language": "en-US,en;q=0.9",
 };
 
-// Redding polygon + agencies + categories
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -55,9 +53,7 @@ const BASE = {
     timezone: "+00:00",
     relativeDate: "custom",
     id: "5dfab4da933cf80011f565bc",
-    // both numeric + domain agency IDs
     agencyIds: "112398,112005,ci.anderson.ca.us,cityofredding.org",
-    // high-level categories
     parentIncidentTypeIds:
       "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
   },
@@ -69,6 +65,7 @@ const fetchJSON = async (url, opts = {}) => {
   const t = setTimeout(() => controller.abort(), 15000);
   const r = await fetch(url, { ...opts, signal: controller.signal });
   clearTimeout(t);
+  if (!r.ok) throw new Error(`Upstream ${r.status}`);
   return r.json();
 };
 
@@ -90,24 +87,14 @@ function groupCount(arr, keyFn) {
   return m;
 }
 
-function clampHours(n) {
-  const h = Number.isFinite(n) ? Math.floor(n) : 72;
-  // allow 1..168 (up to 7 days); your UI will mostly use 72/36/24/12/6/3/1
-  return Math.max(1, Math.min(168, h));
-}
-
-/* ---------- RAW debug (first 2KB of response) ---------- */
+/* ---------- RAW peek (param hours) ---------- */
 app.get("/api/raw", async (req, res) => {
   try {
-    const hours = clampHours(parseInt(req.query.hours, 10) || 72);
+    const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
     const now = new Date();
     const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
 
-    const body = {
-      ...BASE,
-      propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() },
-    };
-
+    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
     const r = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
     const status = r.status;
     const text = await r.text();
@@ -119,11 +106,10 @@ app.get("/api/raw", async (req, res) => {
   }
 });
 
-/* ---------- Main: dynamic hours ---------- */
-/* Example: /api/redding?hours=24  (default 72) */
+/* ---------- JSON for widget (param hours) ---------- */
 app.get("/api/redding", async (req, res) => {
   try {
-    const hours = clampHours(parseInt(req.query.hours, 10) || 72);
+    const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
     const now = new Date();
     const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
 
@@ -151,7 +137,6 @@ app.get("/api/redding", async (req, res) => {
     const categories = groupCount(incidents, (i) => i.parent);
     const zones = groupCount(incidents, (i) => i.zone);
 
-    res.set("Cache-Control", "no-store");
     res.json({
       updated: now.toISOString(),
       hours,
@@ -166,12 +151,10 @@ app.get("/api/redding", async (req, res) => {
   }
 });
 
-/* ---------- Back-compat alias (fixed 72h) ---------- */
+/* ---------- legacy alias (kept for your existing widget) ---------- */
 app.get("/api/redding-72h", (req, res) => {
   req.query.hours = "72";
-  // re-use /api/redding handler
   app._router.handle(req, res, () => {}, "GET", "/api/redding");
 });
 
-/* ---------- Start ---------- */
 app.listen(PORT, () => console.log("cityprotect-api on :" + PORT));
