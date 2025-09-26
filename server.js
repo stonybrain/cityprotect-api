@@ -4,10 +4,6 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ---------- ENV (Discord) ---------- */
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
-const NOTIFY_SECRET = process.env.NOTIFY_SECRET || ""; // optional but recommended
-
 /* ---------- CORS ---------- */
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
@@ -32,7 +28,7 @@ const H = {
   "accept-language": "en-US,en;q=0.9",
 };
 
-// Base body
+// Base request body (Redding bbox etc.)
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -70,15 +66,17 @@ const fetchJSON = async (url, opts = {}) => {
   const t = setTimeout(() => controller.abort(), 15000);
   const r = await fetch(url, { ...opts, signal: controller.signal });
   clearTimeout(t);
-  // try text -> json to improve error logging if bad JSON
   const text = await r.text();
-  try { return JSON.parse(text); } catch {
-    // if not JSON, throw with body included
+  try { return JSON.parse(text); }
+  catch {
     const err = new Error(`Bad JSON from ${url} (status ${r.status}): ${text.slice(0,200)}`);
     err.status = r.status;
     throw err;
   }
 };
+
+// choose first non-null/undefined/empty string
+const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
 
 // Very simple zone classifier for Redding
 function zoneFor(lat, lon) {
@@ -115,11 +113,12 @@ app.get("/api/raw", async (_req, res) => {
   }
 });
 
-/* ---------- 72h + zones + categories (one page) ---------- */
-app.get("/api/redding-72h", async (_req, res) => {
+/* ---------- Generic: /api/redding?hours=1..72 ---------- */
+app.get("/api/redding", async (req, res) => {
   try {
+    const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
     const now = new Date();
-    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
 
     const body = {
       ...BASE,
@@ -133,142 +132,58 @@ app.get("/api/redding-72h", async (_req, res) => {
     const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
     const raw = j?.result?.list?.incidents ?? [];
 
+    // map to minimal schema + extra fields (defensive field picking)
     const incidents = raw.map((x) => {
       const lon = x.location?.coordinates?.[0] ?? null;
       const lat = x.location?.coordinates?.[1] ?? null;
+
+      const datetime = pick(
+        x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
+      );
+      const address = pick(
+        x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
+      );
+      const incidentId = pick(x.id, x.incidentId, x.reportNumber, x.caseNumber);
+
+      const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
+      const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
+      const parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
+
       return {
-        id: x.id || null,
-        type: x.incidentType || x.parentIncidentType || "Unknown",
-        parent: x.parentIncidentType || "Unknown",
-        parentTypeId: x.parentIncidentTypeId ?? null,
-        lon, lat,
+        id: incidentId || null,
+        type,
+        parent,
+        parentTypeId,
+        lat, lon,
         zone: zoneFor(lat, lon),
+        datetime: datetime ? new Date(datetime).toISOString() : null,
+        address: address || null,
       };
     });
 
     const categories = groupCount(incidents, (i) => i.parent);
     const zones = groupCount(incidents, (i) => i.zone);
 
+    res.set("Cache-Control", "no-store");
     res.json({
       updated: now.toISOString(),
-      hours: 72,
+      hours,
       total: incidents.length,
       categories,
       zones,
       incidents,
     });
   } catch (e) {
-    console.error("72H error:", e);
+    console.error("redding error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
   }
 });
 
-/* ======================================================================
-   ==============   DISCORD NOTIFICATIONS (optional)  ====================
-   ====================================================================== */
-
-/** Minimal in-memory sent-id set (resets on redeploy). */
-const SENT_IDS = new Set();
-
-/** Format a short Discord message for a batch of incidents. */
-function formatDiscordMessage(newItems, totalCount) {
-  const lines = [];
-  lines.push(`**Redding Crime — New Incidents (${newItems.length})**`);
-  const take = newItems.slice(0, 10); // show first 10
-  for (const i of take) {
-    const z = i.zone || "Unknown";
-    const ll = (i.lat != null && i.lon != null)
-      ? ` (${i.lat.toFixed(4)}, ${i.lon.toFixed(4)})` : "";
-    lines.push(`• ${i.type} — ${z}${ll}`);
-  }
-  if (newItems.length > take.length) {
-    lines.push(`…and ${newItems.length - take.length} more.`);
-  }
-  lines.push(`_Window: last 72 hours. Total in window: ${totalCount}._`);
-  return lines.join("\n");
-}
-
-/** Post to Discord webhook. */
-async function postToDiscord(content) {
-  if (!DISCORD_WEBHOOK_URL) {
-    throw new Error("DISCORD_WEBHOOK_URL not set");
-  }
-  const payload = {
-    content,
-    username: "AAX Crime Alerts",
-    allowed_mentions: { parse: [] }
-  };
-  const r = await fetch(DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Discord webhook failed (${r.status}): ${t.slice(0,200)}`);
-  }
-}
-
-/**
- * GET /api/notify?key=SECRET
- * - Fetches /api/redding-72h internally
- * - Filters out incidents we've already sent (by id)
- * - Sends a batch message to Discord if there are new ones
- */
-app.get("/api/notify", async (req, res) => {
-  try {
-    if (NOTIFY_SECRET) {
-      const key = (req.query.key || "").toString();
-      if (key !== NOTIFY_SECRET) return res.status(401).json({ error: "unauthorized" });
-    }
-
-    // Pull the current 72h snapshot
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    const r = await fetch(`${baseUrl}/api/redding-72h`, { headers: { "cache-control": "no-store" }});
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(`Failed to fetch redding-72h (${r.status}): ${t.slice(0,200)}`);
-    }
-    const data = await r.json();
-    const incidents = data?.incidents || [];
-
-    // Determine which are new (by id)
-    const newOnes = incidents.filter(i => i?.id && !SENT_IDS.has(i.id));
-
-    if (newOnes.length === 0) {
-      return res.json({ ok: true, sent: 0, message: "No new incidents." });
-    }
-
-    // Mark them as sent (so the next call only sends new stuff)
-    newOnes.forEach(i => SENT_IDS.add(i.id));
-
-    // Build + send the message
-    const msg = formatDiscordMessage(newOnes, data.total || incidents.length);
-    await postToDiscord(msg);
-
-    res.json({ ok: true, sent: newOnes.length });
-  } catch (e) {
-    console.error("notify error:", e);
-    res.status(500).json({ error: e?.message || "notify-failed" });
-  }
+/* ---------- Back-compat: /api/redding-72h ---------- */
+app.get("/api/redding-72h", (req, res) => {
+  req.query.hours = "72";
+  app._router.handle(req, res, () => {}, "GET", "/api/redding");
 });
 
-/**
- * GET /api/notify-test?key=SECRET
- * - Sends a simple test message to confirm webhook works
- */
-app.get("/api/notify-test", async (req, res) => {
-  try {
-    if (NOTIFY_SECRET) {
-      const key = (req.query.key || "").toString();
-      if (key !== NOTIFY_SECRET) return res.status(401).json({ error: "unauthorized" });
-    }
-    await postToDiscord("✅ Test from AAX Crime Alerts — webhook is working.");
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("notify-test error:", e);
-    res.status(500).json({ error: e?.message || "notify-test-failed" });
-  }
-});
-
+/* ---------- Start ---------- */
 app.listen(PORT, () => console.log("cityprotect-api on :" + PORT));
