@@ -75,8 +75,86 @@ const fetchJSON = async (url, opts = {}) => {
   }
 };
 
-// pick first non-empty
+// read nested path like "properties.address.line1"
+function readPath(obj, path) {
+  if (!obj) return undefined;
+  return path.split(".").reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj);
+}
+
+// pick first non-empty among many candidates
 const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
+
+// Try hard to find a timestamp string anywhere in record
+function extractDateISO(x) {
+  const tryKeys = [
+    // common top-level
+    "occurredDate", "occurredOn", "occurrenceDate", "occuredOn",
+    "reportedDate", "reportDate", "reportedOn",
+    "createdDate", "createDate", "createdOn", "timestamp", "eventDate", "dateTime",
+    // nested
+    "properties.occurredDate", "properties.occurredOn", "properties.reportedDate",
+    "properties.createdDate", "properties.dateTime", "properties.timestamp"
+  ];
+  for (const k of tryKeys) {
+    const v = k.includes(".") ? readPath(x, k) : x?.[k];
+    if (v && typeof v === "string") {
+      const dt = new Date(v);
+      if (!isNaN(dt)) return dt.toISOString();
+    }
+  }
+  // As a last resort, scan enumerable string fields that look like dates
+  for (const [k, v] of Object.entries(x || {})) {
+    if (typeof v === "string" && /date|time/i.test(k)) {
+      const dt = new Date(v);
+      if (!isNaN(dt)) return dt.toISOString();
+    }
+  }
+  if (x?.properties) {
+    for (const [k, v] of Object.entries(x.properties)) {
+      if (typeof v === "string" && /date|time/i.test(k)) {
+        const dt = new Date(v);
+        if (!isNaN(dt)) return dt.toISOString();
+      }
+    }
+  }
+  return null;
+}
+
+// Build best-possible address string
+function extractAddress(x) {
+  // direct, already formatted
+  const direct = pick(
+    x.address, x.formattedAddress, x.commonPlaceName, x.locationName, x.blockAddress,
+    readPath(x, "properties.address"), readPath(x, "properties.formattedAddress"),
+    readPath(x, "properties.commonPlaceName"), readPath(x, "properties.locationName"),
+    readPath(x, "properties.blockAddress")
+  );
+  if (direct) return String(direct);
+
+  // try parts
+  const parts = {
+    number: pick(x.streetNumber, readPath(x, "properties.streetNumber")),
+    street: pick(x.streetName, readPath(x, "properties.streetName")),
+    line1: pick(readPath(x, "properties.address.line1")),
+    line2: pick(readPath(x, "properties.address.line2")),
+    city: pick(x.city, readPath(x, "properties.city")),
+    state: pick(x.state, readPath(x, "properties.state")),
+    postal: pick(x.postalCode, x.zip, readPath(x, "properties.postalCode"), readPath(x, "properties.zip"))
+  };
+
+  // Construct from line1/line2 if present
+  if (parts.line1 || parts.line2) {
+    const left = [parts.line1, parts.line2].filter(Boolean).join(", ");
+    const right = [parts.city, parts.state, parts.postal].filter(Boolean).join(" ");
+    return [left, right].filter(Boolean).join(", ");
+  }
+
+  // Construct from number + street
+  const street = [parts.number, parts.street].filter(Boolean).join(" ").trim();
+  const cityStateZip = [parts.city, parts.state, parts.postal].filter(Boolean).join(" ");
+  const out = [street || null, cityStateZip || null].filter(Boolean).join(", ");
+  return out || null;
+}
 
 // simple zones
 function zoneFor(lat, lon) {
@@ -134,17 +212,15 @@ async function fetchRedding(hours) {
     const lon = x.location?.coordinates?.[0] ?? null;
     const lat = x.location?.coordinates?.[1] ?? null;
 
-    const datetime = pick(
-      x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
-    );
-    const address = pick(
-      x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
-    );
+    // IDs & types
     const incidentId = pick(x.id, x.incidentId, x.reportNumber, x.caseNumber);
-
     const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
     const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
     const parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
+
+    // datetime & address (improved)
+    const datetimeISO = extractDateISO(x);
+    const address = extractAddress(x);
 
     return {
       id: incidentId || null,
@@ -153,8 +229,8 @@ async function fetchRedding(hours) {
       parentTypeId,
       lat, lon,
       zone: zoneFor(lat, lon),
-      datetime: datetime ? new Date(datetime).toISOString() : null,
-      address: address || null
+      datetime: datetimeISO,
+      address: address
     };
   });
 
