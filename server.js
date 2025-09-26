@@ -1,5 +1,6 @@
-import express from "express";
-import fetch from "node-fetch";
+// server.js (CommonJS — no "type":"module" needed)
+const express = require("express");
+const fetch = require("node-fetch");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -28,7 +29,7 @@ const H = {
   "accept-language": "en-US,en;q=0.9",
 };
 
-// Base request body (Redding bbox etc.)
+// Redding bbox + base body
 const BASE = {
   limit: 2000,
   offset: 0,
@@ -75,10 +76,10 @@ const fetchJSON = async (url, opts = {}) => {
   }
 };
 
-// choose first non-null/undefined/empty string
+// pick first non-empty
 const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
 
-// Very simple zone classifier for Redding
+// simple zones
 function zoneFor(lat, lon) {
   if (lat == null || lon == null) return "Unknown";
   if (lat >= 40.62) return "North Redding";
@@ -113,66 +114,71 @@ app.get("/api/raw", async (_req, res) => {
   }
 });
 
-/* ---------- Generic: /api/redding?hours=1..72 ---------- */
+/* ---------- Core fetcher ---------- */
+async function fetchRedding(hours) {
+  const now = new Date();
+  const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
+
+  const body = {
+    ...BASE,
+    propertyMap: {
+      ...BASE.propertyMap,
+      fromDate: from.toISOString(),
+      toDate: now.toISOString(),
+    },
+  };
+
+  const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
+  const raw = j?.result?.list?.incidents ?? [];
+
+  const incidents = raw.map((x) => {
+    const lon = x.location?.coordinates?.[0] ?? null;
+    const lat = x.location?.coordinates?.[1] ?? null;
+
+    const datetime = pick(
+      x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
+    );
+    const address = pick(
+      x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
+    );
+    const incidentId = pick(x.id, x.incidentId, x.reportNumber, x.caseNumber);
+
+    const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
+    const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
+    const parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
+
+    return {
+      id: incidentId || null,
+      type,
+      parent,
+      parentTypeId,
+      lat, lon,
+      zone: zoneFor(lat, lon),
+      datetime: datetime ? new Date(datetime).toISOString() : null,
+      address: address || null,
+    };
+  });
+
+  const categories = groupCount(incidents, (i) => i.parent);
+  const zones = groupCount(incidents, (i) => i.zone);
+
+  return {
+    updated: now.toISOString(),
+    hours,
+    total: incidents.length,
+    categories,
+    zones,
+    incidents,
+  };
+}
+
+/* ---------- /api/redding?hours=1..72 ---------- */
 app.get("/api/redding", async (req, res) => {
   try {
     const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
-    const now = new Date();
-    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
-
-    const body = {
-      ...BASE,
-      propertyMap: {
-        ...BASE.propertyMap,
-        fromDate: from.toISOString(),
-        toDate: now.toISOString(),
-      },
-    };
-
-    const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
-    const raw = j?.result?.list?.incidents ?? [];
-
-    // map to minimal schema + extra fields (defensive field picking)
-    const incidents = raw.map((x) => {
-      const lon = x.location?.coordinates?.[0] ?? null;
-      const lat = x.location?.coordinates?.[1] ?? null;
-
-      const datetime = pick(
-        x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
-      );
-      const address = pick(
-        x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
-      );
-      const incidentId = pick(x.id, x.incidentId, x.reportNumber, x.caseNumber);
-
-      const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
-      const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
-      const parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
-
-      return {
-        id: incidentId || null,
-        type,
-        parent,
-        parentTypeId,
-        lat, lon,
-        zone: zoneFor(lat, lon),
-        datetime: datetime ? new Date(datetime).toISOString() : null,
-        address: address || null,
-      };
-    });
-
-    const categories = groupCount(incidents, (i) => i.parent);
-    const zones = groupCount(incidents, (i) => i.zone);
-
+    const data = await fetchRedding(hours);
     res.set("Cache-Control", "no-store");
-    res.json({
-      updated: now.toISOString(),
-      hours,
-      total: incidents.length,
-      categories,
-      zones,
-      incidents,
-    });
+    res.json(data);
   } catch (e) {
     console.error("redding error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
@@ -180,9 +186,15 @@ app.get("/api/redding", async (req, res) => {
 });
 
 /* ---------- Back-compat: /api/redding-72h ---------- */
-app.get("/api/redding-72h", (req, res) => {
-  req.query.hours = "72";
-  app._router.handle(req, res, () => {}, "GET", "/api/redding");
+app.get("/api/redding-72h", async (req, res) => {
+  try {
+    const data = await fetchRedding(72);
+    res.set("Cache-Control", "no-store");
+    res.json(data);
+  } catch (e) {
+    console.error("redding-72h error:", e);
+    res.status(500).json({ error: e?.message || "fetch-failed" });
+  }
 });
 
 /* ---------- Start ---------- */
