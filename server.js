@@ -1,6 +1,5 @@
-// server.js (CommonJS — no "type":"module" needed)
+// server.js — CommonJS, uses Node 18's global fetch
 const express = require("express");
-const fetch = require("node-fetch");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -26,7 +25,7 @@ const H = {
   origin: "https://www.cityprotect.com",
   referer: "https://www.cityprotect.com/",
   "user-agent": "Mozilla/5.0",
-  "accept-language": "en-US,en;q=0.9",
+  "accept-language": "en-US,en;q=0.9"
 };
 
 // Redding bbox + base body
@@ -40,8 +39,8 @@ const BASE = {
       [-122.55479867, 40.37101482],
       [-122.55479867, 40.77626157],
       [-122.20872933, 40.77626157],
-      [-122.20872933, 40.37101482],
-    ]],
+      [-122.20872933, 40.37101482]
+    ]]
   },
   projection: true,
   propertyMap: {
@@ -57,8 +56,8 @@ const BASE = {
     id: "5dfab4da933cf80011f565bc",
     agencyIds: "112398,112005,ci.anderson.ca.us,cityofredding.org",
     parentIncidentTypeIds:
-      "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
-  },
+      "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
+  }
 };
 
 /* ---------- Helpers ---------- */
@@ -124,8 +123,8 @@ async function fetchRedding(hours) {
     propertyMap: {
       ...BASE.propertyMap,
       fromDate: from.toISOString(),
-      toDate: now.toISOString(),
-    },
+      toDate: now.toISOString()
+    }
   };
 
   const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
@@ -155,7 +154,7 @@ async function fetchRedding(hours) {
       lat, lon,
       zone: zoneFor(lat, lon),
       datetime: datetime ? new Date(datetime).toISOString() : null,
-      address: address || null,
+      address: address || null
     };
   });
 
@@ -168,7 +167,7 @@ async function fetchRedding(hours) {
     total: incidents.length,
     categories,
     zones,
-    incidents,
+    incidents
   };
 }
 
@@ -186,7 +185,7 @@ app.get("/api/redding", async (req, res) => {
 });
 
 /* ---------- Back-compat: /api/redding-72h ---------- */
-app.get("/api/redding-72h", async (req, res) => {
+app.get("/api/redding-72h", async (_req, res) => {
   try {
     const data = await fetchRedding(72);
     res.set("Cache-Control", "no-store");
