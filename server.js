@@ -116,7 +116,7 @@ const BASE = {
       [-122.20872933, 40.37101482]
     ]]
   },
-  projection: true,
+  projection: false,
   propertyMap: {
     pageSize: "2000",
     zoomLevel: "11",
