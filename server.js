@@ -8,9 +8,8 @@ if (typeof fetch === "undefined") {
 const express = require("express");
 
 // ---------- (optional) Response compression ----------
-// If you can add a dep: `npm i compression`
 let compression;
-try { compression = require("compression"); } catch { /* no-op if not installed */ }
+try { compression = require("compression"); } catch {}
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -21,14 +20,9 @@ const ENABLE_REVERSE_GEOCODE =
 const NOMINATIM_UA =
   process.env.NOMINATIM_UA || "AAXCrime/1.0 (contact: Brad@aaxalarm.com)";
 
-// Max reverse-geocodes we’ll attempt per request (keeps latency predictable)
 const MAX_GEOCODE_PER_REQ = Number(process.env.MAX_GEOCODE_PER_REQ || 15);
-
-// API response cache TTL (seconds)
-const API_CACHE_TTL_SEC = Number(process.env.API_CACHE_TTL_SEC || 60);
-
-// Default limit used when lite=1 and no ?limit= is supplied
-const DEFAULT_LITE_LIMIT = Number(process.env.DEFAULT_LITE_LIMIT || 200);
+const API_CACHE_TTL_SEC   = Number(process.env.API_CACHE_TTL_SEC || 60);
+const DEFAULT_LITE_LIMIT  = Number(process.env.DEFAULT_LITE_LIMIT || 200);
 
 /* ---------- CORS ---------- */
 app.use((req, res, next) => {
@@ -39,7 +33,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// (optional) enable compression if available
 if (compression) app.use(compression());
 
 /* ---------- Health ---------- */
@@ -106,6 +99,45 @@ const fetchJSON = async (url, opts = {}) => {
 
 const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
 
+// Robust date normalizer -> Date | null
+function normalizeTS(v) {
+  if (v == null) return null;
+
+  // number: seconds or milliseconds
+  if (typeof v === "number") {
+    const ms = v > 1e12 ? v : v * 1000;
+    const d = new Date(ms);
+    return isNaN(d) ? null : d;
+  }
+
+  if (typeof v === "string") {
+    // JSON.NET style: /Date(1695782400000)/
+    const m = v.match(/Date\((\d+)\)/);
+    if (m) {
+      const d = new Date(parseInt(m[1], 10));
+      return isNaN(d) ? null : d;
+    }
+
+    // "YYYY-MM-DD HH:mm:ss" -> assume UTC
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(v)) {
+      const d = new Date(v.replace(" ", "T") + "Z");
+      return isNaN(d) ? null : d;
+    }
+
+    // "YYYY-MM-DDTHH:mm:ss(.sss)" without zone -> assume UTC
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(v)) {
+      const d = new Date(v + "Z");
+      return isNaN(d) ? null : d;
+    }
+
+    // Anything else, let Date try
+    const d = new Date(v);
+    return isNaN(d) ? null : d;
+  }
+
+  return null;
+}
+
 // zones
 function zoneFor(lat, lon) {
   if (lat == null || lon == null) return "Unknown";
@@ -126,7 +158,6 @@ function groupCount(arr, keyFn) {
 }
 
 /* ---------- Reverse geocode (optional) ---------- */
-// in-memory cache (very small, rotates)
 const geoCache = new Map();
 const GEO_CACHE_MAX = 2000;
 
@@ -157,12 +188,10 @@ async function reverseGeocode(lat, lon) {
     ].filter(Boolean);
     let line = parts.join(", ") || j.display_name || null;
 
-    // keep addresses short (helps payload + UI)
     if (line && line.length > 90) line = line.slice(0, 87) + "…";
 
     if (line) {
       if (geoCache.size > GEO_CACHE_MAX) {
-        // evict ~10% oldest
         const n = Math.ceil(GEO_CACHE_MAX * 0.1);
         let i = 0;
         for (const k of geoCache.keys()) { geoCache.delete(k); if (++i >= n) break; }
@@ -203,7 +232,6 @@ function getCache(key) {
 }
 function setCache(key, data) {
   apiCache.set(key, { ts: nowSec(), data });
-  // prune occasionally
   if (apiCache.size > 200) {
     for (const [k, v] of apiCache) {
       if (nowSec() - v.ts > API_CACHE_TTL_SEC) apiCache.delete(k);
@@ -214,9 +242,9 @@ function setCache(key, data) {
 /* ---------- Core fetcher with skinny mode ---------- */
 async function fetchRedding(hours, options = {}) {
   const {
-    doGeocode = false,    // true | false
-    lite = false,         // keep only essential fields
-    limit = null          // cap number of incidents returned
+    doGeocode = false,
+    lite = false,
+    limit = null
   } = options;
 
   const now = new Date();
@@ -234,7 +262,6 @@ async function fetchRedding(hours, options = {}) {
   const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
   let raw = j?.result?.list?.incidents ?? [];
 
-  // Apply limit ASAP to shrink downstream work
   let sliceN = limit && Number.isFinite(limit) ? Math.max(1, Math.min(limit, raw.length)) : raw.length;
   raw = raw.slice(0, sliceN);
 
@@ -242,40 +269,39 @@ async function fetchRedding(hours, options = {}) {
     const lonRaw = x.location?.coordinates?.[0] ?? null;
     const latRaw = x.location?.coordinates?.[1] ?? null;
 
-    // round to 5 decimals for smaller payload + better cache hits
     const lon = lonRaw == null ? null : Number(lonRaw.toFixed(5));
     const lat = latRaw == null ? null : Number(latRaw.toFixed(5));
 
-    const datetime = pick(
-      x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
+    // ---- WIDER set of possible date fields + normalize ----
+    const datetimeRaw = pick(
+      x.occurredDate, x.occurredOn, x.occurrenceDate, x.startDate, x.startTime,
+      x.reportedDate, x.reportedOn, x.reportDate,
+      x.createdDate, x.createDate, x.createdOn,
+      x.eventDate, x.updatedDate, x.lastUpdatedDate
     );
+    const dtObj = normalizeTS(datetimeRaw);
+    const datetime = dtObj ? dtObj.toISOString() : null;
+
     const address = pick(
       x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
     );
 
-    const id = pick(x.incidentId, x.id, x.reportNumber, x.caseNumber) || null;
-    const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
-    const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
+    const id    = pick(x.incidentId, x.id, x.reportNumber, x.caseNumber) || null;
+    const type  = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
+    const parent= pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
 
-    // Base record (skinny by default)
     const base = {
-      id,
-      type,
-      parent,
+      id, type, parent,
       lat, lon,
       zone: zoneFor(lat, lon),
-      datetime: datetime ? new Date(datetime).toISOString() : null,
+      datetime,                 // <-- fixed
       address: address || null
     };
 
-    if (!lite) {
-      // include a little extra only in non-lite mode
-      base.parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
-    }
+    if (!lite) base.parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
     return base;
   });
 
-  // reverse-geocode only a limited number per request to keep response fast
   if (doGeocode) {
     let filled = 0;
     for (const i of incidents) {
@@ -287,9 +313,8 @@ async function fetchRedding(hours, options = {}) {
     }
   }
 
-  // We keep aggregates in both modes so existing widgets don’t break
   const categories = groupCount(incidents, (i) => i.parent);
-  const zones = groupCount(incidents, (i) => i.zone);
+  const zones      = groupCount(incidents, (i) => i.zone);
 
   return {
     updated: now.toISOString(),
@@ -305,12 +330,10 @@ async function fetchRedding(hours, options = {}) {
 function parseFlags(req) {
   const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
 
-  // geocode modes: "1"/"true" => prefill some; "click" => none (on-click in UI)
   const geoq = String(req.query.geocode || "").toLowerCase();
   const doGeocode = geoq === "1" || geoq === "true" || (ENABLE_REVERSE_GEOCODE && geoq !== "click");
 
-  // lite mode trims fields and defaults to a limit
-  const lite = String(req.query.lite || "").toLowerCase() === "1" || String(req.query.lite || "").toLowerCase() === "true";
+  const lite = ["1","true"].includes(String(req.query.lite||"").toLowerCase());
   const limit = Number.isFinite(parseInt(req.query.limit, 10))
     ? Math.max(1, parseInt(req.query.limit, 10))
     : (lite ? DEFAULT_LITE_LIMIT : null);
@@ -344,7 +367,6 @@ app.get("/api/redding", async (req, res) => {
 /* ---------- Back-compat: /api/redding-72h ---------- */
 app.get("/api/redding-72h", async (req, res) => {
   try {
-    // same flags but force hours=72 for compatibility
     const { doGeocode, lite, limit } = parseFlags(req);
     const hours = 72;
 
