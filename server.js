@@ -273,14 +273,29 @@ async function fetchRedding(hours, options = {}) {
     const lat = latRaw == null ? null : Number(latRaw.toFixed(5));
 
     // ---- WIDER set of possible date fields + normalize ----
-    const datetimeRaw = pick(
-      x.occurredDate, x.occurredOn, x.occurrenceDate, x.startDate, x.startTime,
-      x.reportedDate, x.reportedOn, x.reportDate,
-      x.createdDate, x.createDate, x.createdOn,
-      x.eventDate, x.updatedDate, x.lastUpdatedDate
-    );
-    const dtObj = normalizeTS(datetimeRaw);
-    const datetime = dtObj ? dtObj.toISOString() : null;
+   // ---- EVEN WIDER set of possible date fields + normalize ----
+const datetimeRaw = pick(
+  // occurred / occurrence
+  x.occurredDate, x.occurredOn, x.occurrenceDate, x.occurrenceOn,
+  // start / event
+  x.startDateTime, x.startDate, x.startTime, x.eventDateTime, x.eventDate,
+  // reported
+  x.reportedDateTime, x.reportedDate, x.reportedOn, x.reportDate,
+  x.reportedUtc, x.reportedOnUtc,
+  // created / updated
+  x.createdDateTime, x.createdDate, x.createDate, x.createdOn,
+  x.updatedDateTime, x.updatedDate, x.lastUpdatedDate,
+  // generic
+  x.timestamp, x.time, x.datetime
+);
+// If some APIs nest under "properties" or similar, try those too
+const nestedTime = pick(
+  x?.properties?.occurredDate, x?.properties?.reportedDate, x?.properties?.createdDate,
+  x?.details?.occurredDate, x?.details?.reportedDate
+);
+
+const dtObj = normalizeTS(datetimeRaw || nestedTime);
+const datetime = dtObj ? dtObj.toISOString() : null;
 
     const address = pick(
       x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
