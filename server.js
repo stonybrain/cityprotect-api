@@ -8,9 +8,9 @@ if (typeof fetch === "undefined") {
 const express = require("express");
 
 // ---------- (optional) Response compression ----------
-// If you can add a dep: `npm i compression`
+// Install once to enable: `npm i compression`
 let compression;
-try { compression = require("compression"); } catch { /* no-op if not installed */ }
+try { compression = require("compression"); } catch { /* ok if missing */ }
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -21,7 +21,7 @@ const ENABLE_REVERSE_GEOCODE =
 const NOMINATIM_UA =
   process.env.NOMINATIM_UA || "AAXCrime/1.0 (contact: Brad@aaxalarm.com)";
 
-// Max reverse-geocodes we’ll attempt per request (keeps latency predictable)
+// Max reverse-geocodes per request (keeps latency predictable)
 const MAX_GEOCODE_PER_REQ = Number(process.env.MAX_GEOCODE_PER_REQ || 15);
 
 // API response cache TTL (seconds)
@@ -156,7 +156,7 @@ async function reverseGeocode(lat, lon) {
 
     if (line) {
       if (geoCache.size > GEO_CACHE_MAX) {
-        // evict 10% oldest
+        // evict ~10% oldest
         const n = Math.ceil(GEO_CACHE_MAX * 0.1);
         let i = 0;
         for (const k of geoCache.keys()) { geoCache.delete(k); if (++i >= n) break; }
@@ -205,6 +205,19 @@ function setCache(key, data) {
   }
 }
 
+/* ---------- Stale-while-revalidate helper ---------- */
+async function getOrRevalidate(cacheKey, computeFn) {
+  const hit = getCache(cacheKey);
+  if (hit) {
+    // background refresh (don’t await)
+    computeFn().then(data => setCache(cacheKey, data)).catch(()=>{});
+    return hit;
+  }
+  const fresh = await computeFn();
+  setCache(cacheKey, fresh);
+  return fresh;
+}
+
 /* ---------- Core fetcher ---------- */
 async function fetchRedding(hours, doGeocode) {
   const now = new Date();
@@ -250,16 +263,22 @@ async function fetchRedding(hours, doGeocode) {
     };
   });
 
-  // reverse-geocode only a limited number per request to keep response fast
+  // reverse-geocode a LIMITED number per request (tiny concurrency, polite)
   if (doGeocode) {
-    let filled = 0;
-    for (const i of incidents) {
-      if (filled >= MAX_GEOCODE_PER_REQ) break;
-      if (!i.address && i.lat != null && i.lon != null) {
+    const targets = incidents
+      .filter(i => !i.address && i.lat != null && i.lon != null)
+      .slice(0, MAX_GEOCODE_PER_REQ);
+
+    const limit = Math.min(2, targets.length); // concurrency=2
+    let idx = 0;
+    async function worker() {
+      while (idx < targets.length) {
+        const i = targets[idx++];
         const addr = await reverseGeocode(i.lat, i.lon);
-        if (addr) { i.address = addr; filled++; }
+        if (addr) i.address = addr;
       }
     }
+    await Promise.all(Array.from({ length: limit }, worker));
   }
 
   const categories = groupCount(incidents, (i) => i.parent);
@@ -283,14 +302,7 @@ app.get("/api/redding", async (req, res) => {
       req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
 
     const cacheKey = `redding:${hours}:${wantGeo ? "geo" : "plain"}`;
-    const cached = getCache(cacheKey);
-    if (cached) {
-      res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
-      return res.json(cached);
-    }
-
-    const data = await fetchRedding(hours, wantGeo);
-    setCache(cacheKey, data);
+    const data = await getOrRevalidate(cacheKey, () => fetchRedding(hours, wantGeo));
 
     res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
     res.json(data);
@@ -307,14 +319,7 @@ app.get("/api/redding-72h", async (req, res) => {
       req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
 
     const cacheKey = `redding:72:${wantGeo ? "geo" : "plain"}`;
-    const cached = getCache(cacheKey);
-    if (cached) {
-      res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
-      return res.json(cached);
-    }
-
-    const data = await fetchRedding(72, wantGeo);
-    setCache(cacheKey, data);
+    const data = await getOrRevalidate(cacheKey, () => fetchRedding(72, wantGeo));
 
     res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
     res.json(data);
