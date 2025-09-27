@@ -1,4 +1,16 @@
-// server.js — CommonJS, uses Node 18's global fetch
+// server.js — CommonJS, Node 18+ (global fetch)
+
+// -------------------- Config (env) --------------------
+const ENABLE_REVERSE_GEOCODE = (process.env.ENABLE_REVERSE_GEOCODE || "false").toLowerCase() === "true";
+// how many missing-address incidents to reverse geocode per API response
+const REV_MAX_PER_RESPONSE = parseInt(process.env.REV_MAX_PER_RESPONSE || "30", 10);
+// delay between reverse geocode calls (ms) to respect Nominatim usage policy
+const REV_RATE_MS = parseInt(process.env.REV_RATE_MS || "1200", 10);
+// cache key rounding (decimal places); higher = more precise, more cache misses
+const REV_CACHE_PRECISION = parseInt(process.env.REV_CACHE_PRECISION || "4", 10);
+// user agent required by Nominatim policy (please customize to your site/contact)
+const NOMINATIM_UA = process.env.NOMINATIM_UA || "AAXCrime/1.0 (contact: admin@example.com)";
+
 const express = require("express");
 
 const app = express();
@@ -15,7 +27,7 @@ app.use((req, res, next) => {
 
 /* ---------- Health ---------- */
 app.get("/", (_, res) => res.send("ok"));
-app.get("/api/test", (_, res) => res.json({ ok: true }));
+app.get("/api/test", (_, res) => res.json({ ok: true, reverseGeocode: ENABLE_REVERSE_GEOCODE }));
 
 /* ---------- CityProtect config ---------- */
 const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
@@ -75,10 +87,10 @@ const fetchJSON = async (url, opts = {}) => {
   }
 };
 
-// pick first non-empty
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
 const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
 
-// simple zones
 function zoneFor(lat, lon) {
   if (lat == null || lon == null) return "Unknown";
   if (lat >= 40.62) return "North Redding";
@@ -113,6 +125,55 @@ app.get("/api/raw", async (_req, res) => {
   }
 });
 
+/* ---------- Reverse geocoding (optional) ---------- */
+// Simple in-memory cache (resets on redeploy)
+const revCache = new Map(); // key: "lat,lon" (rounded), value: "address string"
+
+/** Build a friendly short address from a Nominatim response */
+function formatNominatimAddress(json) {
+  // Prefer a short form like "123 Main St, Redding"
+  const a = json.address || {};
+  const parts = [];
+
+  const number = a.house_number || a.building || "";
+  const road = a.road || a.residential || a.pedestrian || a.cycleway || a.footway || a.path || "";
+  const city = a.city || a.town || a.village || a.hamlet || a.municipality || a.county || "";
+  const state = a.state || "";
+  const postcode = a.postcode || "";
+
+  const street = [number, road].filter(Boolean).join(" ").trim();
+  if (street) parts.push(street);
+  if (city) parts.push(city);
+  // Keep it short; omit state/postcode unless nothing else
+  if (!street && !city && (state || postcode)) parts.push([state, postcode].filter(Boolean).join(" "));
+
+  const shortLine = parts.join(", ").trim();
+  return shortLine || json.display_name || null;
+}
+
+async function reverseGeocode(lat, lon) {
+  if (lat == null || lon == null) return null;
+  const key = `${lat.toFixed(REV_CACHE_PRECISION)},${lon.toFixed(REV_CACHE_PRECISION)}`;
+  if (revCache.has(key)) return revCache.get(key);
+
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1&accept-language=en`;
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": NOMINATIM_UA,
+      "Accept": "application/json"
+    }
+  });
+  if (!r.ok) {
+    // Cache a null to avoid hammering on failures
+    revCache.set(key, null);
+    return null;
+  }
+  const j = await r.json().catch(() => ({}));
+  const addr = formatNominatimAddress(j);
+  revCache.set(key, addr || null);
+  return addr || null;
+}
+
 /* ---------- Core fetcher ---------- */
 async function fetchRedding(hours) {
   const now = new Date();
@@ -130,12 +191,15 @@ async function fetchRedding(hours) {
   const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
   const raw = j?.result?.list?.incidents ?? [];
 
+  // Map minimal fields
   const incidents = raw.map((x) => {
     const lon = x.location?.coordinates?.[0] ?? null;
     const lat = x.location?.coordinates?.[1] ?? null;
 
     const datetime = pick(
-      x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
+      x.occurredDate, x.occurredOn, x.occurrenceDate,
+      x.reportedDate, x.createdDate, x.createDate,
+      x.startDate, x.eventDate, x.dateReported, x.datetime, x.timestamp
     );
     const address = pick(
       x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
@@ -157,6 +221,22 @@ async function fetchRedding(hours) {
       address: address || null
     };
   });
+
+  // Optional: fill missing addresses via reverse geocoding (throttled)
+  if (ENABLE_REVERSE_GEOCODE) {
+    const missing = incidents.filter(i => !i.address && i.lat != null && i.lon != null).slice(0, REV_MAX_PER_RESPONSE);
+    for (let i = 0; i < missing.length; i++) {
+      const it = missing[i];
+      try {
+        // polite rate limiting
+        if (i > 0) await sleep(REV_RATE_MS);
+        const addr = await reverseGeocode(it.lat, it.lon);
+        if (addr) it.address = addr;
+      } catch {
+        // swallow and continue; address stays null
+      }
+    }
+  }
 
   const categories = groupCount(incidents, (i) => i.parent);
   const zones = groupCount(incidents, (i) => i.zone);
@@ -193,6 +273,20 @@ app.get("/api/redding-72h", async (_req, res) => {
   } catch (e) {
     console.error("redding-72h error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
+  }
+});
+
+/* ---------- Optional: test a single reverse geocode ---------- */
+app.get("/api/reverse", async (req, res) => {
+  try {
+    if (!ENABLE_REVERSE_GEOCODE) return res.status(400).json({ error: "reverse geocode disabled" });
+    const lat = parseFloat(req.query.lat);
+    const lon = parseFloat(req.query.lon);
+    if (Number.isNaN(lat) || Number.isNaN(lon)) return res.status(400).json({ error: "lat/lon required" });
+    const addr = await reverseGeocode(lat, lon);
+    res.json({ lat, lon, address: addr });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "reverse-failed" });
   }
 });
 
