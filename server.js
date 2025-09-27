@@ -1,15 +1,31 @@
-// server.js — CommonJS, Node 18+ (uses global fetch)
+// server.js — CommonJS, Node 18+ (works on older Node via optional polyfill)
+
+// ---------- (optional) Polyfill fetch for Node <18 ----------
+if (typeof fetch === "undefined") {
+  global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
+}
+
 const express = require("express");
+
+// ---------- (optional) Response compression ----------
+// If you can add a dep: `npm i compression`
+let compression;
+try { compression = require("compression"); } catch { /* no-op if not installed */ }
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ---------- ENV (reverse geocode) ---------- */
+/* ---------- ENV (reverse geocode & tuning) ---------- */
 const ENABLE_REVERSE_GEOCODE =
   String(process.env.ENABLE_REVERSE_GEOCODE || "").toLowerCase() === "true";
 const NOMINATIM_UA =
-  process.env.NOMINATIM_UA ||
-  "AAXCrime/1.0 (contact: Brad@aaxalarm.com)";
+  process.env.NOMINATIM_UA || "AAXCrime/1.0 (contact: Brad@aaxalarm.com)";
+
+// Max reverse-geocodes we’ll attempt per request (keeps latency predictable)
+const MAX_GEOCODE_PER_REQ = Number(process.env.MAX_GEOCODE_PER_REQ || 15);
+
+// API response cache TTL (seconds)
+const API_CACHE_TTL_SEC = Number(process.env.API_CACHE_TTL_SEC || 60);
 
 /* ---------- CORS ---------- */
 app.use((req, res, next) => {
@@ -20,13 +36,15 @@ app.use((req, res, next) => {
   next();
 });
 
+// (optional) enable compression if available
+if (compression) app.use(compression());
+
 /* ---------- Health ---------- */
 app.get("/", (_, res) => res.send("ok"));
 app.get("/api/test", (_, res) => res.json({ ok: true }));
 
 /* ---------- CityProtect config ---------- */
-const EP =
-  "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
+const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
 const H = {
   "content-type": "application/json",
   accept: "application/json",
@@ -42,15 +60,13 @@ const BASE = {
   offset: 0,
   geoJson: {
     type: "Polygon",
-    coordinates: [
-      [
-        [-122.20872933, 40.37101482],
-        [-122.55479867, 40.37101482],
-        [-122.55479867, 40.77626157],
-        [-122.20872933, 40.77626157],
-        [-122.20872933, 40.37101482],
-      ],
-    ],
+    coordinates: [[
+      [-122.20872933, 40.37101482],
+      [-122.55479867, 40.37101482],
+      [-122.55479867, 40.77626157],
+      [-122.20872933, 40.77626157],
+      [-122.20872933, 40.37101482]
+    ]]
   },
   projection: true,
   propertyMap: {
@@ -66,8 +82,8 @@ const BASE = {
     id: "5dfab4da933cf80011f565bc",
     agencyIds: "112398,112005,ci.anderson.ca.us,cityofredding.org",
     parentIncidentTypeIds:
-      "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
-  },
+      "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
+  }
 };
 
 /* ---------- Helpers ---------- */
@@ -77,18 +93,15 @@ const fetchJSON = async (url, opts = {}) => {
   const r = await fetch(url, { ...opts, signal: controller.signal });
   clearTimeout(t);
   const text = await r.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    const err = new Error(
-      `Bad JSON from ${url} (status ${r.status}): ${text.slice(0, 200)}`
-    );
+  try { return JSON.parse(text); }
+  catch {
+    const err = new Error(`Bad JSON from ${url} (status ${r.status}): ${text.slice(0,200)}`);
     err.status = r.status;
     throw err;
   }
 };
 
-const pick = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== "");
+const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
 
 // zones
 function zoneFor(lat, lon) {
@@ -110,7 +123,7 @@ function groupCount(arr, keyFn) {
 }
 
 /* ---------- Reverse geocode (optional) ---------- */
-// very small in-memory cache (key: "lat,lon" => address string)
+// in-memory cache (very small, rotates)
 const geoCache = new Map();
 const GEO_CACHE_MAX = 2000;
 
@@ -121,16 +134,14 @@ async function reverseGeocode(lat, lon) {
   const key = `${lat.toFixed(5)},${lon.toFixed(5)}`;
   if (geoCache.has(key)) return geoCache.get(key);
 
-  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(
-    lat
-  )}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
+  const url =
+    `https://nominatim.openstreetmap.org/reverse` +
+    `?format=jsonv2&lat=${encodeURIComponent(lat)}` +
+    `&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
 
   try {
     const r = await fetch(url, {
-      headers: {
-        "User-Agent": NOMINATIM_UA,
-        "Accept": "application/json",
-      },
+      headers: { "User-Agent": NOMINATIM_UA, "Accept": "application/json" }
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
@@ -139,20 +150,19 @@ async function reverseGeocode(lat, lon) {
     const parts = [
       [a.house_number, a.road].filter(Boolean).join(" "),
       a.neighbourhood || a.suburb,
-      a.city || a.town || a.village,
+      a.city || a.town || a.village
     ].filter(Boolean);
     const line = parts.join(", ") || j.display_name || null;
 
-    // maintain tiny cache
-    if (geoCache.size > GEO_CACHE_MAX) {
-      const drop = Math.ceil(GEO_CACHE_MAX * 0.1);
-      let i = 0;
-      for (const k of geoCache.keys()) {
-        geoCache.delete(k);
-        if (++i >= drop) break;
+    if (line) {
+      if (geoCache.size > GEO_CACHE_MAX) {
+        // evict 10% oldest
+        const n = Math.ceil(GEO_CACHE_MAX * 0.1);
+        let i = 0;
+        for (const k of geoCache.keys()) { geoCache.delete(k); if (++i >= n) break; }
       }
+      geoCache.set(key, line);
     }
-    if (line) geoCache.set(key, line);
     return line;
   } catch {
     return null;
@@ -164,19 +174,8 @@ app.get("/api/raw", async (_req, res) => {
   try {
     const now = new Date();
     const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
-    const body = {
-      ...BASE,
-      propertyMap: {
-        ...BASE.propertyMap,
-        fromDate: from.toISOString(),
-        toDate: now.toISOString(),
-      },
-    };
-    const r = await fetch(EP, {
-      method: "POST",
-      headers: H,
-      body: JSON.stringify(body),
-    });
+    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
+    const r = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
     const status = r.status;
     const text = await r.text();
     res.set("Cache-Control", "no-store");
@@ -186,25 +185,24 @@ app.get("/api/raw", async (_req, res) => {
   }
 });
 
-/* ====================== API RESPONSE CACHE (60s) ======================= */
-const API_CACHE = new Map(); // key: `redding:${hours}:${geo?1:0}` -> { payload, ts }
-const CACHE_TTL_MS = 60 * 1000;
+/* ---------- API response cache (TTL) ---------- */
+const apiCache = new Map(); // key -> { ts:number, data:object }
+const nowSec = () => Math.floor(Date.now() / 1000);
 
-function cacheGet(key) {
-  const hit = API_CACHE.get(key);
+function getCache(key) {
+  const hit = apiCache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.ts > CACHE_TTL_MS) {
-    API_CACHE.delete(key);
-    return null;
+  if (nowSec() - hit.ts > API_CACHE_TTL_SEC) { apiCache.delete(key); return null; }
+  return hit.data;
+}
+function setCache(key, data) {
+  apiCache.set(key, { ts: nowSec(), data });
+  // prune occasionally
+  if (apiCache.size > 200) {
+    for (const [k, v] of apiCache) {
+      if (nowSec() - v.ts > API_CACHE_TTL_SEC) apiCache.delete(k);
+    }
   }
-  return hit.payload;
-}
-function cacheSet(key, payload) {
-  API_CACHE.set(key, { payload, ts: Date.now() });
-}
-function setCacheHeaders(res) {
-  // browsers/CDNs may reuse for 60s; can serve slightly stale while revalidating
-  res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=30");
 }
 
 /* ---------- Core fetcher ---------- */
@@ -217,48 +215,27 @@ async function fetchRedding(hours, doGeocode) {
     propertyMap: {
       ...BASE.propertyMap,
       fromDate: from.toISOString(),
-      toDate: now.toISOString(),
-    },
+      toDate: now.toISOString()
+    }
   };
 
-  const j = await fetchJSON(EP, {
-    method: "POST",
-    headers: H,
-    body: JSON.stringify(body),
-  });
+  const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
   const raw = j?.result?.list?.incidents ?? [];
 
-  // Build minimal records first
   const incidents = raw.map((x) => {
     const lon = x.location?.coordinates?.[0] ?? null;
     const lat = x.location?.coordinates?.[1] ?? null;
 
     const datetime = pick(
-      x.occurredDate,
-      x.occurredOn,
-      x.occurrenceDate,
-      x.reportedDate,
-      x.createdDate,
-      x.createDate
+      x.occurredDate, x.occurredOn, x.occurrenceDate, x.reportedDate, x.createdDate, x.createDate
     );
     const address = pick(
-      x.address,
-      x.formattedAddress,
-      x.locationName,
-      x.blockAddress,
-      x.commonPlaceName
-    ); // often null from CityProtect
-
+      x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
+    );
     const incidentId = pick(x.incidentId, x.id, x.reportNumber, x.caseNumber);
 
     const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
-    const parent = pick(
-      x.parentIncidentType,
-      x.parentCategory,
-      x.category,
-      type,
-      "Unknown"
-    );
+    const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
     const parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
 
     return {
@@ -266,19 +243,21 @@ async function fetchRedding(hours, doGeocode) {
       type,
       parent,
       parentTypeId,
-      lat,
-      lon,
+      lat, lon,
       zone: zoneFor(lat, lon),
       datetime: datetime ? new Date(datetime).toISOString() : null,
-      address: address || null,
+      address: address || null
     };
   });
 
-  // If requested, fill missing addresses via reverse geocode
+  // reverse-geocode only a limited number per request to keep response fast
   if (doGeocode) {
+    let filled = 0;
     for (const i of incidents) {
+      if (filled >= MAX_GEOCODE_PER_REQ) break;
       if (!i.address && i.lat != null && i.lon != null) {
-        i.address = await reverseGeocode(i.lat, i.lon);
+        const addr = await reverseGeocode(i.lat, i.lon);
+        if (addr) { i.address = addr; filled++; }
       }
     }
   }
@@ -292,7 +271,7 @@ async function fetchRedding(hours, doGeocode) {
     total: incidents.length,
     categories,
     zones,
-    incidents,
+    incidents
   };
 }
 
@@ -303,16 +282,17 @@ app.get("/api/redding", async (req, res) => {
     const wantGeo =
       req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
 
-    const cacheKey = `redding:${hours}:${wantGeo ? 1 : 0}`;
-    const cached = cacheGet(cacheKey);
+    const cacheKey = `redding:${hours}:${wantGeo ? "geo" : "plain"}`;
+    const cached = getCache(cacheKey);
     if (cached) {
-      setCacheHeaders(res);
+      res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
       return res.json(cached);
     }
 
     const data = await fetchRedding(hours, wantGeo);
-    cacheSet(cacheKey, data);
-    setCacheHeaders(res);
+    setCache(cacheKey, data);
+
+    res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
     res.json(data);
   } catch (e) {
     console.error("redding error:", e);
@@ -326,16 +306,17 @@ app.get("/api/redding-72h", async (req, res) => {
     const wantGeo =
       req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
 
-    const cacheKey = `redding:72:${wantGeo ? 1 : 0}`;
-    const cached = cacheGet(cacheKey);
+    const cacheKey = `redding:72:${wantGeo ? "geo" : "plain"}`;
+    const cached = getCache(cacheKey);
     if (cached) {
-      setCacheHeaders(res);
+      res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
       return res.json(cached);
     }
 
     const data = await fetchRedding(72, wantGeo);
-    cacheSet(cacheKey, data);
-    setCacheHeaders(res);
+    setCache(cacheKey, data);
+
+    res.set("Cache-Control", `public, max-age=${API_CACHE_TTL_SEC}`);
     res.json(data);
   } catch (e) {
     console.error("redding-72h error:", e);
