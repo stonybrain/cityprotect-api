@@ -1,69 +1,3 @@
-/* ---------- Debug time fields ---------- */
-// Lists the first 10 incidents and shows every "time-ish" field + the parsed datetime
-app.get("/api/debug-times", async (_req, res) => {
-  try {
-    const data = await fetchRedding(72, { doGeocode: false, lite: false, limit: 50 });
-    const sample = (data.incidents || []);
-    // Re-fetch raw to inspect original keys/values (so we can show what came in)
-    // NOTE: duplicating the POST once here for clarity
-    const now = new Date();
-    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
-    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
-    const rawJ = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
-    const raw = rawJ?.result?.list?.incidents ?? [];
-
-    const timeFieldNames = [
-      "occurredDate","occurredOn","occurrenceDate","occurrenceOn",
-      "startDateTime","startDate","startTime",
-      "eventDateTime","eventDate",
-      "reportedDateTime","reportedDate","reportedOn","reportDate","reportedUtc","reportedOnUtc",
-      "createdDateTime","createdDate","createDate","createdOn",
-      "updatedDateTime","updatedDate","lastUpdatedDate",
-      "timestamp","time","datetime",
-      // nested areas
-      "properties.occurredDate","properties.reportedDate","properties.createdDate",
-      "details.occurredDate","details.reportedDate"
-    ];
-
-    // Build a helper to safely pluck nested
-    const get = (obj, path) => {
-      if (!path.includes(".")) return obj?.[path];
-      const [a,b] = path.split(".");
-      return obj?.[a]?.[b];
-    };
-
-    const out = raw.slice(0, 10).map((r, idx) => {
-      const found = {};
-      for (const f of timeFieldNames) {
-        const v = get(r, f);
-        if (v !== undefined && v !== null && v !== "") found[f] = v;
-      }
-      // what our mapper would choose now:
-      const chosen = pick(
-        r.occurredDate, r.occurredOn, r.occurrenceDate, r.occurrenceOn,
-        r.startDateTime, r.startDate, r.startTime, r.eventDateTime, r.eventDate,
-        r.reportedDateTime, r.reportedDate, r.reportedOn, r.reportDate, r.reportedUtc, r.reportedOnUtc,
-        r.createdDateTime, r.createdDate, r.createDate, r.createdOn,
-        r.updatedDateTime, r.updatedDate, r.lastUpdatedDate,
-        r.timestamp, r.time, r.datetime,
-        r?.properties?.occurredDate, r?.properties?.reportedDate, r?.properties?.createdDate,
-        r?.details?.occurredDate, r?.details?.reportedDate
-      );
-      const parsed = normalizeTS(chosen);
-      return {
-        index: idx,
-        id: r.incidentId || r.id || r.reportNumber || r.caseNumber || null,
-        foundTimeFields: found,
-        chosenSourceFieldValue: chosen ?? null,
-        parsedISO: parsed ? parsed.toISOString() : null
-      };
-    });
-
-    res.json({ count: out.length, examples: out });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || "debug-failed" });
-  }
-});
 
 
 
@@ -274,6 +208,120 @@ function groupCount(arr, keyFn) {
   }
   return m;
 }
+
+
+
+
+/* ---------- Debug time fields ---------- */
+// Lists the first 10 incidents and shows every "time-ish" field + the parsed datetime
+app.get("/api/debug-times", async (_req, res) => {
+  try {
+    const data = await fetchRedding(72, { doGeocode: false, lite: false, limit: 50 });
+    const sample = (data.incidents || []);
+    // Re-fetch raw to inspect original keys/values (so we can show what came in)
+    // NOTE: duplicating the POST once here for clarity
+    const now = new Date();
+    const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
+    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
+    const rawJ = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
+    const raw = rawJ?.result?.list?.incidents ?? [];
+
+    const timeFieldNames = [
+      "occurredDate","occurredOn","occurrenceDate","occurrenceOn",
+      "startDateTime","startDate","startTime",
+      "eventDateTime","eventDate",
+      "reportedDateTime","reportedDate","reportedOn","reportDate","reportedUtc","reportedOnUtc",
+      "createdDateTime","createdDate","createDate","createdOn",
+      "updatedDateTime","updatedDate","lastUpdatedDate",
+      "timestamp","time","datetime",
+      // nested areas
+      "properties.occurredDate","properties.reportedDate","properties.createdDate",
+      "details.occurredDate","details.reportedDate"
+    ];
+
+    // Build a helper to safely pluck nested
+    const get = (obj, path) => {
+      if (!path.includes(".")) return obj?.[path];
+      const [a,b] = path.split(".");
+      return obj?.[a]?.[b];
+    };
+
+    const out = raw.slice(0, 10).map((r, idx) => {
+      const found = {};
+      for (const f of timeFieldNames) {
+        const v = get(r, f);
+        if (v !== undefined && v !== null && v !== "") found[f] = v;
+      }
+      // what our mapper would choose now:
+      const chosen = pick(
+        r.occurredDate, r.occurredOn, r.occurrenceDate, r.occurrenceOn,
+        r.startDateTime, r.startDate, r.startTime, r.eventDateTime, r.eventDate,
+        r.reportedDateTime, r.reportedDate, r.reportedOn, r.reportDate, r.reportedUtc, r.reportedOnUtc,
+        r.createdDateTime, r.createdDate, r.createDate, r.createdOn,
+        r.updatedDateTime, r.updatedDate, r.lastUpdatedDate,
+        r.timestamp, r.time, r.datetime,
+        r?.properties?.occurredDate, r?.properties?.reportedDate, r?.properties?.createdDate,
+        r?.details?.occurredDate, r?.details?.reportedDate
+      );
+      const parsed = normalizeTS(chosen);
+      return {
+        index: idx,
+        id: r.incidentId || r.id || r.reportNumber || r.caseNumber || null,
+        foundTimeFields: found,
+        chosenSourceFieldValue: chosen ?? null,
+        parsedISO: parsed ? parsed.toISOString() : null
+      };
+    });
+
+    res.json({ count: out.length, examples: out });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "debug-failed" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* ---------- Reverse geocode (optional) ---------- */
 const geoCache = new Map();
