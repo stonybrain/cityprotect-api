@@ -129,14 +129,12 @@ async function reverseGeocode(lat, lon) {
     const r = await fetch(url, {
       headers: {
         "User-Agent": NOMINATIM_UA,
-        // polite caching (Nominatim encourages adding it via proxies)
         "Accept": "application/json",
       },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
 
-    // prefer road+house_number + city
     const a = j.address || {};
     const parts = [
       [a.house_number, a.road].filter(Boolean).join(" "),
@@ -147,7 +145,6 @@ async function reverseGeocode(lat, lon) {
 
     // maintain tiny cache
     if (geoCache.size > GEO_CACHE_MAX) {
-      // drop 10% oldest
       const drop = Math.ceil(GEO_CACHE_MAX * 0.1);
       let i = 0;
       for (const k of geoCache.keys()) {
@@ -157,8 +154,7 @@ async function reverseGeocode(lat, lon) {
     }
     if (line) geoCache.set(key, line);
     return line;
-  } catch (e) {
-    // don’t fail the whole request just because geocode failed
+  } catch {
     return null;
   }
 }
@@ -189,6 +185,27 @@ app.get("/api/raw", async (_req, res) => {
     res.status(500).type("text/plain").send("error: " + (e.message || e));
   }
 });
+
+/* ====================== API RESPONSE CACHE (60s) ======================= */
+const API_CACHE = new Map(); // key: `redding:${hours}:${geo?1:0}` -> { payload, ts }
+const CACHE_TTL_MS = 60 * 1000;
+
+function cacheGet(key) {
+  const hit = API_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL_MS) {
+    API_CACHE.delete(key);
+    return null;
+  }
+  return hit.payload;
+}
+function cacheSet(key, payload) {
+  API_CACHE.set(key, { payload, ts: Date.now() });
+}
+function setCacheHeaders(res) {
+  // browsers/CDNs may reuse for 60s; can serve slightly stale while revalidating
+  res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=30");
+}
 
 /* ---------- Core fetcher ---------- */
 async function fetchRedding(hours, doGeocode) {
@@ -259,8 +276,6 @@ async function fetchRedding(hours, doGeocode) {
 
   // If requested, fill missing addresses via reverse geocode
   if (doGeocode) {
-    // do a polite, sequential fill to avoid hammering Nominatim
-    // (you can parallelize with a small concurrency if needed)
     for (const i of incidents) {
       if (!i.address && i.lat != null && i.lon != null) {
         i.address = await reverseGeocode(i.lat, i.lon);
@@ -287,8 +302,17 @@ app.get("/api/redding", async (req, res) => {
     const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
     const wantGeo =
       req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
+
+    const cacheKey = `redding:${hours}:${wantGeo ? 1 : 0}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      setCacheHeaders(res);
+      return res.json(cached);
+    }
+
     const data = await fetchRedding(hours, wantGeo);
-    res.set("Cache-Control", "no-store");
+    cacheSet(cacheKey, data);
+    setCacheHeaders(res);
     res.json(data);
   } catch (e) {
     console.error("redding error:", e);
@@ -301,8 +325,17 @@ app.get("/api/redding-72h", async (req, res) => {
   try {
     const wantGeo =
       req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
+
+    const cacheKey = `redding:72:${wantGeo ? 1 : 0}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      setCacheHeaders(res);
+      return res.json(cached);
+    }
+
     const data = await fetchRedding(72, wantGeo);
-    res.set("Cache-Control", "no-store");
+    cacheSet(cacheKey, data);
+    setCacheHeaders(res);
     res.json(data);
   } catch (e) {
     console.error("redding-72h error:", e);
