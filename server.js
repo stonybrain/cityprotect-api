@@ -1,20 +1,15 @@
-// server.js — CommonJS, Node 18+ (global fetch)
-
-// -------------------- Config (env) --------------------
-const ENABLE_REVERSE_GEOCODE = (process.env.ENABLE_REVERSE_GEOCODE || "false").toLowerCase() === "true";
-// how many missing-address incidents to reverse geocode per API response
-const REV_MAX_PER_RESPONSE = parseInt(process.env.REV_MAX_PER_RESPONSE || "30", 10);
-// delay between reverse geocode calls (ms) to respect Nominatim usage policy
-const REV_RATE_MS = parseInt(process.env.REV_RATE_MS || "1200", 10);
-// cache key rounding (decimal places); higher = more precise, more cache misses
-const REV_CACHE_PRECISION = parseInt(process.env.REV_CACHE_PRECISION || "4", 10);
-// user agent required by Nominatim policy (please customize to your site/contact)
-const NOMINATIM_UA = process.env.NOMINATIM_UA || "AAXCrime/1.0 (contact: admin@example.com)";
-
+// server.js — CommonJS, Node 18+ (uses global fetch)
 const express = require("express");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+/* ---------- ENV (reverse geocode) ---------- */
+const ENABLE_REVERSE_GEOCODE =
+  String(process.env.ENABLE_REVERSE_GEOCODE || "").toLowerCase() === "true";
+const NOMINATIM_UA =
+  process.env.NOMINATIM_UA ||
+  "AAXCrime/1.0 (contact: Brad@aaxalarm.com)";
 
 /* ---------- CORS ---------- */
 app.use((req, res, next) => {
@@ -27,17 +22,18 @@ app.use((req, res, next) => {
 
 /* ---------- Health ---------- */
 app.get("/", (_, res) => res.send("ok"));
-app.get("/api/test", (_, res) => res.json({ ok: true, reverseGeocode: ENABLE_REVERSE_GEOCODE }));
+app.get("/api/test", (_, res) => res.json({ ok: true }));
 
 /* ---------- CityProtect config ---------- */
-const EP = "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
+const EP =
+  "https://ce-portal-service.commandcentral.com/api/v1.0/public/incidents";
 const H = {
   "content-type": "application/json",
   accept: "application/json",
   origin: "https://www.cityprotect.com",
   referer: "https://www.cityprotect.com/",
   "user-agent": "Mozilla/5.0",
-  "accept-language": "en-US,en;q=0.9"
+  "accept-language": "en-US,en;q=0.9",
 };
 
 // Redding bbox + base body
@@ -46,13 +42,15 @@ const BASE = {
   offset: 0,
   geoJson: {
     type: "Polygon",
-    coordinates: [[
-      [-122.20872933, 40.37101482],
-      [-122.55479867, 40.37101482],
-      [-122.55479867, 40.77626157],
-      [-122.20872933, 40.77626157],
-      [-122.20872933, 40.37101482]
-    ]]
+    coordinates: [
+      [
+        [-122.20872933, 40.37101482],
+        [-122.55479867, 40.37101482],
+        [-122.55479867, 40.77626157],
+        [-122.20872933, 40.77626157],
+        [-122.20872933, 40.37101482],
+      ],
+    ],
   },
   projection: true,
   propertyMap: {
@@ -68,8 +66,8 @@ const BASE = {
     id: "5dfab4da933cf80011f565bc",
     agencyIds: "112398,112005,ci.anderson.ca.us,cityofredding.org",
     parentIncidentTypeIds:
-      "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15"
-  }
+      "149,150,148,8,97,104,165,98,100,179,178,180,101,99,103,163,168,166,12,161,14,16,15",
+  },
 };
 
 /* ---------- Helpers ---------- */
@@ -79,18 +77,20 @@ const fetchJSON = async (url, opts = {}) => {
   const r = await fetch(url, { ...opts, signal: controller.signal });
   clearTimeout(t);
   const text = await r.text();
-  try { return JSON.parse(text); }
-  catch {
-    const err = new Error(`Bad JSON from ${url} (status ${r.status}): ${text.slice(0,200)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    const err = new Error(
+      `Bad JSON from ${url} (status ${r.status}): ${text.slice(0, 200)}`
+    );
     err.status = r.status;
     throw err;
   }
 };
 
-const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+const pick = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== "");
 
-const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
-
+// zones
 function zoneFor(lat, lon) {
   if (lat == null || lon == null) return "Unknown";
   if (lat >= 40.62) return "North Redding";
@@ -109,13 +109,78 @@ function groupCount(arr, keyFn) {
   return m;
 }
 
+/* ---------- Reverse geocode (optional) ---------- */
+// very small in-memory cache (key: "lat,lon" => address string)
+const geoCache = new Map();
+const GEO_CACHE_MAX = 2000;
+
+async function reverseGeocode(lat, lon) {
+  if (!ENABLE_REVERSE_GEOCODE) return null;
+  if (lat == null || lon == null) return null;
+
+  const key = `${lat.toFixed(5)},${lon.toFixed(5)}`;
+  if (geoCache.has(key)) return geoCache.get(key);
+
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(
+    lat
+  )}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
+
+  try {
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": NOMINATIM_UA,
+        // polite caching (Nominatim encourages adding it via proxies)
+        "Accept": "application/json",
+      },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+
+    // prefer road+house_number + city
+    const a = j.address || {};
+    const parts = [
+      [a.house_number, a.road].filter(Boolean).join(" "),
+      a.neighbourhood || a.suburb,
+      a.city || a.town || a.village,
+    ].filter(Boolean);
+    const line = parts.join(", ") || j.display_name || null;
+
+    // maintain tiny cache
+    if (geoCache.size > GEO_CACHE_MAX) {
+      // drop 10% oldest
+      const drop = Math.ceil(GEO_CACHE_MAX * 0.1);
+      let i = 0;
+      for (const k of geoCache.keys()) {
+        geoCache.delete(k);
+        if (++i >= drop) break;
+      }
+    }
+    if (line) geoCache.set(key, line);
+    return line;
+  } catch (e) {
+    // don’t fail the whole request just because geocode failed
+    return null;
+  }
+}
+
 /* ---------- RAW (debug 72h) ---------- */
 app.get("/api/raw", async (_req, res) => {
   try {
     const now = new Date();
     const from = new Date(now.getTime() - 72 * 60 * 60 * 1000);
-    const body = { ...BASE, propertyMap: { ...BASE.propertyMap, fromDate: from.toISOString(), toDate: now.toISOString() } };
-    const r = await fetch(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
+    const body = {
+      ...BASE,
+      propertyMap: {
+        ...BASE.propertyMap,
+        fromDate: from.toISOString(),
+        toDate: now.toISOString(),
+      },
+    };
+    const r = await fetch(EP, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify(body),
+    });
     const status = r.status;
     const text = await r.text();
     res.set("Cache-Control", "no-store");
@@ -125,57 +190,8 @@ app.get("/api/raw", async (_req, res) => {
   }
 });
 
-/* ---------- Reverse geocoding (optional) ---------- */
-// Simple in-memory cache (resets on redeploy)
-const revCache = new Map(); // key: "lat,lon" (rounded), value: "address string"
-
-/** Build a friendly short address from a Nominatim response */
-function formatNominatimAddress(json) {
-  // Prefer a short form like "123 Main St, Redding"
-  const a = json.address || {};
-  const parts = [];
-
-  const number = a.house_number || a.building || "";
-  const road = a.road || a.residential || a.pedestrian || a.cycleway || a.footway || a.path || "";
-  const city = a.city || a.town || a.village || a.hamlet || a.municipality || a.county || "";
-  const state = a.state || "";
-  const postcode = a.postcode || "";
-
-  const street = [number, road].filter(Boolean).join(" ").trim();
-  if (street) parts.push(street);
-  if (city) parts.push(city);
-  // Keep it short; omit state/postcode unless nothing else
-  if (!street && !city && (state || postcode)) parts.push([state, postcode].filter(Boolean).join(" "));
-
-  const shortLine = parts.join(", ").trim();
-  return shortLine || json.display_name || null;
-}
-
-async function reverseGeocode(lat, lon) {
-  if (lat == null || lon == null) return null;
-  const key = `${lat.toFixed(REV_CACHE_PRECISION)},${lon.toFixed(REV_CACHE_PRECISION)}`;
-  if (revCache.has(key)) return revCache.get(key);
-
-  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1&accept-language=en`;
-  const r = await fetch(url, {
-    headers: {
-      "User-Agent": NOMINATIM_UA,
-      "Accept": "application/json"
-    }
-  });
-  if (!r.ok) {
-    // Cache a null to avoid hammering on failures
-    revCache.set(key, null);
-    return null;
-  }
-  const j = await r.json().catch(() => ({}));
-  const addr = formatNominatimAddress(j);
-  revCache.set(key, addr || null);
-  return addr || null;
-}
-
 /* ---------- Core fetcher ---------- */
-async function fetchRedding(hours) {
+async function fetchRedding(hours, doGeocode) {
   const now = new Date();
   const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
 
@@ -184,30 +200,48 @@ async function fetchRedding(hours) {
     propertyMap: {
       ...BASE.propertyMap,
       fromDate: from.toISOString(),
-      toDate: now.toISOString()
-    }
+      toDate: now.toISOString(),
+    },
   };
 
-  const j = await fetchJSON(EP, { method: "POST", headers: H, body: JSON.stringify(body) });
+  const j = await fetchJSON(EP, {
+    method: "POST",
+    headers: H,
+    body: JSON.stringify(body),
+  });
   const raw = j?.result?.list?.incidents ?? [];
 
-  // Map minimal fields
+  // Build minimal records first
   const incidents = raw.map((x) => {
     const lon = x.location?.coordinates?.[0] ?? null;
     const lat = x.location?.coordinates?.[1] ?? null;
 
     const datetime = pick(
-      x.occurredDate, x.occurredOn, x.occurrenceDate,
-      x.reportedDate, x.createdDate, x.createDate,
-      x.startDate, x.eventDate, x.dateReported, x.datetime, x.timestamp
+      x.occurredDate,
+      x.occurredOn,
+      x.occurrenceDate,
+      x.reportedDate,
+      x.createdDate,
+      x.createDate
     );
     const address = pick(
-      x.address, x.formattedAddress, x.locationName, x.blockAddress, x.commonPlaceName
-    );
-    const incidentId = pick(x.id, x.incidentId, x.reportNumber, x.caseNumber);
+      x.address,
+      x.formattedAddress,
+      x.locationName,
+      x.blockAddress,
+      x.commonPlaceName
+    ); // often null from CityProtect
+
+    const incidentId = pick(x.incidentId, x.id, x.reportNumber, x.caseNumber);
 
     const type = pick(x.incidentType, x.type, x.parentIncidentType, "Unknown");
-    const parent = pick(x.parentIncidentType, x.parentCategory, x.category, type, "Unknown");
+    const parent = pick(
+      x.parentIncidentType,
+      x.parentCategory,
+      x.category,
+      type,
+      "Unknown"
+    );
     const parentTypeId = pick(x.parentIncidentTypeId, x.categoryId, null);
 
     return {
@@ -215,25 +249,21 @@ async function fetchRedding(hours) {
       type,
       parent,
       parentTypeId,
-      lat, lon,
+      lat,
+      lon,
       zone: zoneFor(lat, lon),
       datetime: datetime ? new Date(datetime).toISOString() : null,
-      address: address || null
+      address: address || null,
     };
   });
 
-  // Optional: fill missing addresses via reverse geocoding (throttled)
-  if (ENABLE_REVERSE_GEOCODE) {
-    const missing = incidents.filter(i => !i.address && i.lat != null && i.lon != null).slice(0, REV_MAX_PER_RESPONSE);
-    for (let i = 0; i < missing.length; i++) {
-      const it = missing[i];
-      try {
-        // polite rate limiting
-        if (i > 0) await sleep(REV_RATE_MS);
-        const addr = await reverseGeocode(it.lat, it.lon);
-        if (addr) it.address = addr;
-      } catch {
-        // swallow and continue; address stays null
+  // If requested, fill missing addresses via reverse geocode
+  if (doGeocode) {
+    // do a polite, sequential fill to avoid hammering Nominatim
+    // (you can parallelize with a small concurrency if needed)
+    for (const i of incidents) {
+      if (!i.address && i.lat != null && i.lon != null) {
+        i.address = await reverseGeocode(i.lat, i.lon);
       }
     }
   }
@@ -247,15 +277,17 @@ async function fetchRedding(hours) {
     total: incidents.length,
     categories,
     zones,
-    incidents
+    incidents,
   };
 }
 
-/* ---------- /api/redding?hours=1..72 ---------- */
+/* ---------- /api/redding?hours=1..72[&geocode=1] ---------- */
 app.get("/api/redding", async (req, res) => {
   try {
     const hours = Math.max(1, Math.min(72, parseInt(req.query.hours, 10) || 72));
-    const data = await fetchRedding(hours);
+    const wantGeo =
+      req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
+    const data = await fetchRedding(hours, wantGeo);
     res.set("Cache-Control", "no-store");
     res.json(data);
   } catch (e) {
@@ -265,28 +297,16 @@ app.get("/api/redding", async (req, res) => {
 });
 
 /* ---------- Back-compat: /api/redding-72h ---------- */
-app.get("/api/redding-72h", async (_req, res) => {
+app.get("/api/redding-72h", async (req, res) => {
   try {
-    const data = await fetchRedding(72);
+    const wantGeo =
+      req.query.geocode === "1" || req.query.geocode === "true" || ENABLE_REVERSE_GEOCODE;
+    const data = await fetchRedding(72, wantGeo);
     res.set("Cache-Control", "no-store");
     res.json(data);
   } catch (e) {
     console.error("redding-72h error:", e);
     res.status(500).json({ error: e?.message || "fetch-failed" });
-  }
-});
-
-/* ---------- Optional: test a single reverse geocode ---------- */
-app.get("/api/reverse", async (req, res) => {
-  try {
-    if (!ENABLE_REVERSE_GEOCODE) return res.status(400).json({ error: "reverse geocode disabled" });
-    const lat = parseFloat(req.query.lat);
-    const lon = parseFloat(req.query.lon);
-    if (Number.isNaN(lat) || Number.isNaN(lon)) return res.status(400).json({ error: "lat/lon required" });
-    const addr = await reverseGeocode(lat, lon);
-    res.json({ lat, lon, address: addr });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || "reverse-failed" });
   }
 });
 
